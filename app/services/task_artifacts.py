@@ -61,6 +61,30 @@ def write_script_data(task_id: str, payload: Mapping[str, Any]) -> None:
     _write_json_atomic(_script_file(task_id), payload)
 
 
+def read_script_data(task_id: str) -> dict | None:
+    """
+    读取任务的 ``script.json``，文件缺失或损坏时返回 ``None``。
+
+    该入口供素材生成等辅助流程复用已持久化的脚本内容，不应因为读取失败
+    中断主流程，因此所有异常都降级为 ``None`` 并记录日志。
+    """
+    try:
+        with _script_file(task_id).open("r", encoding="utf-8") as script_file:
+            payload = json.load(script_file)
+        if not isinstance(payload, dict):
+            raise ValueError("task script data must be a JSON object")
+        return payload
+    except FileNotFoundError:
+        logger.debug(f"task script data not found: task_id={task_id}")
+        return None
+    except Exception as exc:
+        logger.warning(
+            "failed to read task script data: "
+            f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
+        )
+        return None
+
+
 def patch_script_data(task_id: str, **updates: Any) -> bool:
     """
     在保留原有字段的前提下补充任务清单，失败时返回 ``False``。
