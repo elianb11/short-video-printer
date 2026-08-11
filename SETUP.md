@@ -8,7 +8,8 @@ subtitles → composited video.
 
 - ✅ Forked to `github.com/elianb11/short-video-printer`
 - ✅ Cloned here. Remotes: `origin` = my fork, `upstream` = original repo
-- ✅ `config.toml` created from `config.example.toml` (git-ignored — safe for keys)
+- ✅ Synced with upstream **v1.3.3** (2026-08-11) — fork = upstream + this doc
+- ✅ `config.toml` regenerated from the new `config.example.toml` (git-ignored — safe for keys)
 - ⬜ API keys not filled in yet
 - ⬜ Not run yet
 
@@ -16,17 +17,19 @@ subtitles → composited video.
 
 | Line | Field | What to put |
 |------|-------|-------------|
-| 2  | `video_source`     | `"pexels"` (default) or `"pixabay"` |
-| 23 | `pexels_api_keys`  | Free key from https://www.pexels.com/api/ → `["yourkey"]` |
-| 49 | `llm_provider`     | `"openai"` (default) or another provider |
-| 70 | `openai_api_key`   | Your LLM API key |
-| 78 | `openai_model_name`| Defaults to `gpt-4o-mini` |
+| 37 | `video_source`      | `"pexels"` (default), `"pixabay"`, `"coverr"`, or `"local"` |
+| 44 | `pexels_api_keys`   | Free key from https://www.pexels.com/api/ → `["yourkey"]` |
+| 82 | `llm_provider`      | Ships as `"moonshot"` — set to `"openai"` or another provider |
+| 92 | `openai_api_key`    | Your LLM API key |
+| 94 | `openai_model_name` | e.g. `gpt-4o-mini` |
 
-If using Pixabay instead, set `video_source = "pixabay"` and fill `pixabay_api_keys` (line 30).
+Other sources: `pixabay_api_keys` (line 47), `coverr_api_keys` (line 50).
+Each provider has its own `*_api_key` / `*_model_name` block further down the file —
+fill in the one matching your `llm_provider`.
 
 ## How to run
 
-### Option A — Docker (easiest; bundles ffmpeg + Python 3.11)
+### Option A — Docker (easiest; bundles ffmpeg + Python)
 ```sh
 docker compose up
 ```
@@ -42,25 +45,37 @@ uv sync --frozen
 # or: uv run python main.py   # FastAPI only, on :8080
 ```
 
+### Option C — One-shot from the command line
+```sh
+uv run python cli.py --video-subject "How AI is changing everyday life"
+uv run python cli.py --help
+```
+
 ## Architecture (MVC)
 
 | Part | Entry | Port |
 |------|-------|------|
 | REST API (FastAPI) | `main.py` → `app/asgi.py` → `app/controllers/v1/` | 8080 |
 | Web UI (Streamlit) | `webui/Main.py` (via `webui.sh`) | 8501 |
+| CLI | `cli.py` | — |
 
 Pipeline services live in `app/services/`:
 `llm.py` (script) · `material.py` (stock footage) · `voice.py` (TTS) ·
-`subtitle.py` (whisper) · `video.py` (moviepy compositing) · `task.py` (orchestration).
+`subtitle.py` (whisper) · `video.py` (moviepy compositing) · `task.py` (orchestration) ·
+`bgm.py` (background music) · `upload_post.py` (TikTok/Instagram/YouTube Shorts publishing) ·
+`twelvelabs.py` (optional semantic material ranking) · `material_cache.py` · `version_checker.py`.
 
 ## Local environment notes
 
-- System Python is 3.9; project needs 3.11–3.12 → use `uv` (installed) or Docker.
-- `ffmpeg` is **not** installed locally → needed only for Option B.
+- System Python is 3.9; project needs **≥ 3.11** → use `uv` (installed) or Docker.
+- `ffmpeg` is **not** installed locally → needed only for Options B/C.
 - Docker 28.5.0 is installed → Option A works out of the box.
 
 ## Staying in sync with upstream
+
+This fork carries exactly one local commit (this file), rebased on top of upstream:
 ```sh
 git fetch upstream
-git merge upstream/main
+git rebase upstream/main
+git push --force-with-lease origin main
 ```
