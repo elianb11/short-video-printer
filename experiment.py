@@ -115,6 +115,24 @@ def load_spec(path: str) -> dict:
             f"grid expands to {len(values)} variants, above the ceiling of {MAX_VARIANTS}"
         )
 
+    if axis.startswith(_NON_CLI_PREFIXES):
+        # ai_image_* 不是 cli.py 的入参，只能靠环境变量送进子进程，而只有经
+        # ai_image._setting 读取的配置项才会看那个环境变量。轴若不在其中，
+        # 变量导出了却没人读：两个分支实际用同一个取值生成，results.jsonl 却
+        # 标成不同分支——数据看着干净，描述的却是一个从未变化过的变量。
+        # 集合定义在 ai_image 里并在此导入，两边不会各自漂移。
+        from app.services.ai_image import ENV_ROUTED_SETTINGS
+
+        if axis not in ENV_ROUTED_SETTINGS:
+            allowed = ", ".join(sorted(ENV_ROUTED_SETTINGS))
+            raise SpecError(
+                f"grid axis {axis} cannot be varied per run: it is not read through "
+                f"ai_image._setting, so the value would be exported to the subprocess "
+                f"and then ignored, and every arm would silently generate with the "
+                f"config.toml value while results.jsonl labelled them differently. "
+                f"Varyable ai_image settings: {allowed}"
+            )
+
     if base.get("video_source") == "aiimage":
         from app.config import config
 
@@ -130,7 +148,14 @@ def load_spec(path: str) -> dict:
         # 同一个理由的另一面：兜底源再指回 aiimage 就是无限递归。
         # ai_image._fallback_clip 把该配置原样传给 material.download_videos，
         # 而 download_videos 又会把 "aiimage" 派发回 ai_image。
-        if config.app.get("ai_image_fallback_source", "pexels") == "aiimage":
+        #
+        # 该配置现在也经 _setting 读取，spec 的 base 和网格轴都能通过环境变量
+        # 覆盖它，因此三个来源都要查，不能只看 config.toml。
+        fallback_sources = [config.app.get("ai_image_fallback_source", "pexels")]
+        if "ai_image_fallback_source" in base:
+            fallback_sources.append(base["ai_image_fallback_source"])
+        fallback_sources.extend(grid.get("ai_image_fallback_source") or [])
+        if "aiimage" in fallback_sources:
             raise SpecError(
                 'ai_image_fallback_source must not be "aiimage" — the fallback value '
                 "is passed straight back into material.download_videos, which "

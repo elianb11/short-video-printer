@@ -39,6 +39,22 @@ MOTIONS = ("zoom_in", "zoom_out", "pan_left", "pan_right")
 DEFAULT_MAX_IMAGES = 12
 # ai_image_* 设置的环境变量覆盖前缀，见 _setting。
 ENV_SETTING_PREFIX = "MPT_"
+# 真正经 _setting 读取、因而能被环境变量按子进程覆盖的配置项。
+#
+# experiment.py 会为不在此集合内的 ai_image_* 网格轴直接拒绝装载：那种轴会导出
+# 一个没人读的环境变量，两个分支实际用同一个取值生成，results.jsonl 却把它们
+# 标成不同分支——干净漂亮、关于一个根本没变过的变量的数据，是这套系统最坏的
+# 失败方式。新增 ai_image_* 配置项时，要么在读取处改用 _setting 并登记到这里，
+# 要么它就自动被挡在实验网格之外。
+# ai_image_enabled 刻意不在其中：它是成本与功能开关，不是实验变量，不允许被
+# 环境变量翻开。
+ENV_ROUTED_SETTINGS = frozenset({
+    "ai_image_style",
+    "ai_image_motion",
+    "ai_image_model",
+    "ai_image_max_images_per_task",
+    "ai_image_fallback_source",
+})
 
 _ASPECT_RATIOS = {
     VideoAspect.portrait.value: "9:16",
@@ -63,7 +79,7 @@ def beat_count(audio_duration: float, clip_duration: int) -> int:
     clip_duration = max(int(clip_duration or 1), 1)
     count = math.ceil(max(float(audio_duration), 0.0) / clip_duration)
     count = max(count, 1)
-    ceiling = int(config.app.get("ai_image_max_images_per_task", DEFAULT_MAX_IMAGES))
+    ceiling = int(_setting("ai_image_max_images_per_task", DEFAULT_MAX_IMAGES))
     if count > ceiling:
         logger.warning(
             f"beat count {count} exceeds ai_image_max_images_per_task={ceiling}, capping"
@@ -216,7 +232,7 @@ def generate_image(prompt: str, ratio: str, out_path: str) -> str:
 
     client = _imagen_client()
     response = client.models.generate_images(
-        model=config.app.get("ai_image_model", DEFAULT_MODEL),
+        model=_setting("ai_image_model", DEFAULT_MODEL),
         prompt=prompt,
         config=types.GenerateImagesConfig(
             number_of_images=1,
@@ -309,7 +325,7 @@ def _fallback_clip(task_id: str, index: int, video_aspect, clip_duration: int) -
         paths = material.download_videos(
             task_id=task_id,
             search_terms=[term],
-            source=config.app.get("ai_image_fallback_source", "pexels"),
+            source=_setting("ai_image_fallback_source", "pexels"),
             video_aspect=video_aspect,
             audio_duration=float(clip_duration),
             max_clip_duration=clip_duration,

@@ -68,16 +68,20 @@ twelvelabs_rerank_terms = false
 # Requires gemini_api_key from the LLM Providers section below. pexels_api_keys
 # is ALSO required: blocked or failed beats fall back to a stock clip so the
 # video still ships.
+#
+# Environment overrides: every ai_image_* setting below EXCEPT ai_image_enabled
+# is also read from MPT_<UPPERCASE_NAME> (ai_image_style -> MPT_AI_IMAGE_STYLE),
+# which takes precedence over the value here. experiment.py sets them per variant
+# so one grid arm can differ from another without editing this file. A grid axis
+# on any other ai_image_* key is rejected, because the value would be exported and
+# then ignored while the results file labelled the arms as if it had varied.
 ai_image_enabled = false
 # Imagen model id.
 ai_image_model = "imagen-3.0-generate-002"
 # Style suffix appended to every prompt. Without it, each generated image lands
 # in a different art style and the video looks incoherent.
-# The MPT_AI_IMAGE_STYLE environment variable overrides this value; experiment.py
-# sets it per variant so one grid arm can differ from another without editing this file.
 ai_image_style = "peinture à l'huile cinématographique, clair-obscur dramatique, palette or et bleu profond"
 # Ken Burns motion: zoom_in, zoom_out, pan_left, pan_right, or random.
-# The MPT_AI_IMAGE_MOTION environment variable overrides this value, same as above.
 ai_image_motion = "random"
 # Hard ceiling on images per task — cost guard.
 ai_image_max_images_per_task = 12

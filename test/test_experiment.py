@@ -167,6 +167,39 @@ class TestLoadSpec(unittest.TestCase):
             config.app.clear()
             config.app.update(original)
 
+    def test_rejects_grid_axis_on_an_unrouted_ai_image_setting(self):
+        # ai_image_enabled 不经 _setting 读取：这样的轴会导出一个没人读的环境
+        # 变量，两个分支实际用同一个取值生成，却被标成不同分支。
+        bad = {**BASE_SPEC, "grid": {"ai_image_enabled": [True, False]}}
+        with self.assertRaises(experiment.SpecError) as ctx:
+            experiment.load_spec(_write_spec(self.tmp, bad))
+        self.assertIn("ai_image_enabled", str(ctx.exception))
+
+    def test_accepts_grid_axis_on_every_routed_ai_image_setting(self):
+        from app.services.ai_image import ENV_ROUTED_SETTINGS
+
+        for axis in sorted(ENV_ROUTED_SETTINGS):
+            with self.subTest(axis=axis):
+                values = ["pexels", "pixabay"] if axis == "ai_image_fallback_source" \
+                    else ["a", "b"]
+                spec = {**BASE_SPEC, "grid": {axis: values}}
+                self.assertEqual(
+                    experiment.load_spec(_write_spec(self.tmp, spec))["name"],
+                    "myth-fr-round-01",
+                )
+
+    def test_rejects_fallback_source_recursion_declared_in_the_spec(self):
+        # 该配置现在经 _setting 读取，spec 能用环境变量覆盖 config.toml，
+        # 所以只查 config.toml 的旧检查已经不够。
+        for spec in (
+            {**BASE_SPEC, "base": {**BASE_SPEC["base"], "ai_image_fallback_source": "aiimage"}},
+            {**BASE_SPEC, "grid": {"ai_image_fallback_source": ["pexels", "aiimage"]}},
+        ):
+            with self.subTest(spec=spec["grid"]):
+                with self.assertRaises(experiment.SpecError) as ctx:
+                    experiment.load_spec(_write_spec(self.tmp, spec))
+                self.assertIn("recursion", str(ctx.exception).lower())
+
     def test_non_aiimage_spec_ignores_fallback_source(self):
         from app.config import config
 
@@ -253,12 +286,24 @@ class TestBuildSubprocessEnv(unittest.TestCase):
         env = experiment.build_subprocess_env(run)
         self.assertEqual(env, {"MPT_AI_IMAGE_STYLE": "style-a"})
 
-    def test_future_axes_need_no_code_change(self):
+    def test_exported_settings_are_exported_and_read(self):
+        # 导出一个没人读的环境变量，等于给一个从未变化的变量贴上不同的分支标签。
+        # 因此每个导出的键都必须落在 ai_image 真正经 _setting 读取的集合里。
+        from app.services import ai_image
+
         run = {"subject": "s", "variant": {"ai_image_motion": "pan_left"},
                "params": {"ai_image_motion": "pan_left", "ai_image_model": "m"}}
         env = experiment.build_subprocess_env(run)
         self.assertEqual(env,
                          {"MPT_AI_IMAGE_MOTION": "pan_left", "MPT_AI_IMAGE_MODEL": "m"})
+
+        for key in env:
+            setting = key[len(ai_image.ENV_SETTING_PREFIX):].lower()
+            self.assertIn(setting, ai_image.ENV_ROUTED_SETTINGS)
+
+        with patch.dict("os.environ", env):
+            self.assertEqual(ai_image.pick_motion(0), "pan_left")
+            self.assertEqual(ai_image._setting("ai_image_model", "default"), "m")
 
     def test_cli_params_are_not_duplicated_into_the_environment(self):
         run = {"subject": "s", "variant": {}, "params": {"video_clip_duration": 5}}
@@ -531,6 +576,29 @@ class TestRunExperiment(_RunExperimentTestCase):
 
         recorded = [r["variant"]["ai_image_style"] for r in experiment.load_results(self.results)]
         self.assertEqual(recorded, styles)
+
+    def test_model_axis_genuinely_reaches_ai_image(self):
+        # 与 style 同形：从被 mock 的 subprocess.run 上取下真实环境，再把它套到
+        # ai_image 的读取点上，证明这个轴不只是被导出，而是真的被读到了。
+        from app.services import ai_image
+
+        spec = {**BASE_SPEC, "subjects": ["Prométhée"],
+                "grid": {"ai_image_model": ["imagen-3.0-generate-002", "imagen-4.0-ultra"]}}
+
+        with patch("experiment.subprocess.run", return_value=self._completed()) as mock_run, \
+                patch("app.services.task_artifacts.read_script_data", return_value=None):
+            experiment.run_experiment(self._spec_path(spec), self.results)
+
+        seen = []
+        for call in mock_run.call_args_list:
+            with patch.dict("os.environ", call.kwargs["env"], clear=True):
+                seen.append(ai_image._setting("ai_image_model", ai_image.DEFAULT_MODEL))
+
+        self.assertEqual(seen, ["imagen-3.0-generate-002", "imagen-4.0-ultra"])
+        self.assertEqual(len(set(seen)), 2)
+
+        recorded = [r["variant"]["ai_image_model"] for r in experiment.load_results(self.results)]
+        self.assertEqual(recorded, seen)
 
     def test_subprocess_environment_extends_rather_than_replaces_os_environ(self):
         with patch("experiment.subprocess.run", return_value=self._completed()) as mock_run, \

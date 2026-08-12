@@ -317,6 +317,70 @@ class TestEnvSettingOverride(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(ai_image.pick_motion(0), "zoom_out")
 
+    @patch("app.services.ai_image._imagen_client")
+    def test_model_prefers_environment_over_config(self, mock_client):
+        config.app["gemini_api_key"] = "fake-key"
+        config.app["ai_image_model"] = "config-model"
+        generated = MagicMock()
+        generated.image.image_bytes = b"X"
+        response = MagicMock()
+        response.generated_images = [generated]
+        client = MagicMock()
+        client.models.generate_images.return_value = response
+        mock_client.return_value = client
+
+        task_id = f"test-env-model-{uuid4().hex}"
+        try:
+            out_path = ai_image.image_cache_path(task_id, "p")
+            with patch.dict("os.environ", {"MPT_AI_IMAGE_MODEL": "env-model"}):
+                ai_image.generate_image("p", "9:16", out_path)
+            self.assertEqual(
+                client.models.generate_images.call_args.kwargs["model"], "env-model"
+            )
+
+            client.models.generate_images.reset_mock()
+            out_path = ai_image.image_cache_path(task_id, "q")
+            with patch.dict("os.environ", {}, clear=True):
+                ai_image.generate_image("q", "9:16", out_path)
+            self.assertEqual(
+                client.models.generate_images.call_args.kwargs["model"], "config-model"
+            )
+        finally:
+            shutil.rmtree(utils.task_dir(task_id), ignore_errors=True)
+
+    def test_max_images_prefers_environment_over_config(self):
+        config.app["ai_image_max_images_per_task"] = 12
+        with patch.dict("os.environ", {"MPT_AI_IMAGE_MAX_IMAGES_PER_TASK": "3"}):
+            # 环境变量是字符串，成本熔断必须仍然按整数比较。
+            self.assertEqual(ai_image.beat_count(100.0, 5), 3)
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(ai_image.beat_count(100.0, 5), 12)
+
+    def test_fallback_source_prefers_environment_over_config(self):
+        config.app["ai_image_fallback_source"] = "pexels"
+        with patch.dict("os.environ", {"MPT_AI_IMAGE_FALLBACK_SOURCE": "pixabay"}):
+            self.assertEqual(ai_image._setting("ai_image_fallback_source", "pexels"),
+                             "pixabay")
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(ai_image._setting("ai_image_fallback_source", "pexels"),
+                             "pexels")
+
+    def test_every_routed_setting_is_actually_read_through_setting(self):
+        # 集合与真实读取点漂移，就会重新打开"导出了没人读的环境变量"这个洞。
+        source = Path(ai_image.__file__).read_text(encoding="utf-8")
+        for key in ai_image.ENV_ROUTED_SETTINGS:
+            self.assertIn(f'_setting("{key}"', source, f"{key} is not read via _setting")
+            self.assertNotIn(f'config.app.get("{key}"', source,
+                             f"{key} still reads config.app directly")
+
+    def test_enabled_flag_is_deliberately_not_routed(self):
+        # 成本与功能开关不能被环境变量翻开。
+        self.assertNotIn("ai_image_enabled", ai_image.ENV_ROUTED_SETTINGS)
+        config.app["ai_image_enabled"] = False
+        config.app["gemini_api_key"] = "fake-key"
+        with patch.dict("os.environ", {"MPT_AI_IMAGE_ENABLED": "true"}):
+            self.assertFalse(ai_image.is_enabled())
+
 
 class TestKenBurns(unittest.TestCase):
     def setUp(self):
