@@ -101,12 +101,28 @@ Réponds UNIQUEMENT avec un tableau JSON de {count} chaînes, sans texte autour.
 Exemple: ["une silhouette au sommet d'une falaise", "un temple en ruine sous l'orage"]"""
 
 
+def _frame_symbolically(base: str) -> str:
+    """降级路径的关键词同样要象征化包装，否则 "sacrifice"、"bataille"
+    这类原词会直接触发图像模型的安全过滤——而缓解措施正是为这条路径存在的。"""
+    return (
+        f"évocation atmosphérique et symbolique de {base}, suggérée par l'ombre, "
+        "la ruine et la lumière, sans violence explicite ni nudité, sans texte"
+    )
+
+
 def _parse_prompt_list(response: str) -> list[str]:
-    match = re.search(r"\[.*\]", response or "", re.DOTALL)
+    text = (response or "").strip()
+    # llm._generate_response provider 报错时返回 "Error: ..." 字符串而不抛异常，
+    # 必须显式拦截：否则错误文本里若恰好含 JSON 数组，会被当成提示词用。
+    if text.startswith("Error:"):
+        raise ValueError(f"planning response reported a provider error: {text[:200]}")
+    match = re.search(r"\[.*\]", text, re.DOTALL)
     if not match:
         raise ValueError("no JSON array found in planning response")
     items = json.loads(match.group(0))
-    return [str(item).strip() for item in items if str(item).strip()]
+    # 只接受字符串元素：dict/数字被 str() 化后会变成 "{'prompt': 'x'}" 这类垃圾提示词，
+    # 宁可返回空列表让调用方走降级分支。
+    return [item.strip() for item in items if isinstance(item, str) and item.strip()]
 
 
 def plan_prompts(task_id: str, count: int) -> list[str]:
@@ -116,22 +132,32 @@ def plan_prompts(task_id: str, count: int) -> list[str]:
     search_terms = [str(term) for term in script_data.get("search_terms", []) if term]
 
     bases: list[str] = []
+    response = ""
     try:
         response = _generate_response(prompt=_build_planning_prompt(script, count))
         bases = _parse_prompt_list(response)
     except Exception as exc:
+        # 带上截断的响应体，否则真正的 provider 错误会被日志吞掉、无从排查。
         logger.warning(
-            "ai image prompt planning failed, falling back to search terms: "
-            f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
+            "ai image prompt planning failed: "
+            f"task_id={task_id}, error={type(exc).__name__}, detail={exc}, "
+            f"response={str(response)[:300]!r}"
         )
 
     if not bases:
-        bases = search_terms or [script[:200] or "scène mythologique"]
+        logger.warning(
+            f"ai image prompt planning produced no usable prompts, "
+            f"falling back to symbolic keyword prompts: task_id={task_id}"
+        )
+        fallback = search_terms or [script[:200] or "scène mythologique"]
+        bases = [_frame_symbolically(term) for term in fallback]
 
     # 数量对齐：多则截断，少则循环补齐，保证时间线每个分镜都有画面。
     bases = bases[:count]
+    # cycle 必须是补齐开始前的快照：直接对 bases 取模会因 len % len == 0 恒取首条。
+    cycle = list(bases)
     while len(bases) < count:
-        bases.append(bases[len(bases) % max(len(bases), 1)])
+        bases.append(cycle[len(bases) % len(cycle)])
 
     style = _style()
     return [f"{base}, {style}" for base in bases]

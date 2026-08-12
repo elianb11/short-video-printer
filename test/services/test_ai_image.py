@@ -118,6 +118,75 @@ class TestPlanPrompts(unittest.TestCase):
 
     @patch("app.services.ai_image.task_artifacts.read_script_data")
     @patch("app.services.ai_image._generate_response")
+    def test_pads_by_cycling_through_bases(self, mock_llm, mock_script):
+        """补齐必须循环取值，而不是反复重复第一条。"""
+        mock_script.return_value = {"script": "s", "search_terms": []}
+        mock_llm.return_value = '["alpha", "beta", "gamma"]'
+
+        prompts = ai_image.plan_prompts("task-1", 5)
+
+        self.assertEqual(len(prompts), 5)
+        self.assertIn("alpha", prompts[3])
+        self.assertIn("beta", prompts[4])
+        self.assertNotIn("alpha", prompts[4])
+
+    @patch("app.services.ai_image.task_artifacts.read_script_data")
+    @patch("app.services.ai_image._generate_response")
+    def test_fallback_prompts_carry_symbolic_framing(self, mock_llm, mock_script):
+        """降级路径同样要带象征化框架，否则安全缓解在最需要时消失。"""
+        mock_script.return_value = {"script": "s", "search_terms": ["sacrifice", "bataille"]}
+        mock_llm.side_effect = RuntimeError("llm down")
+
+        prompts = ai_image.plan_prompts("task-1", 2)
+
+        self.assertEqual(len(prompts), 2)
+        for prompt in prompts:
+            self.assertIn("symbolique", prompt.lower())
+            self.assertTrue(prompt.endswith("STYLE-LOCK"))
+        self.assertIn("sacrifice", prompts[0])
+
+    @patch("app.services.ai_image.task_artifacts.read_script_data")
+    @patch("app.services.ai_image._generate_response")
+    def test_rejects_non_string_items_and_falls_back(self, mock_llm, mock_script):
+        """字典元素不得被 str() 化成垃圾提示词，应直接降级。"""
+        mock_script.return_value = {"script": "s", "search_terms": ["feu"]}
+        mock_llm.return_value = '[{"prompt": "x"}]'
+
+        prompts = ai_image.plan_prompts("task-1", 1)
+
+        self.assertEqual(len(prompts), 1)
+        self.assertNotIn("'prompt'", prompts[0])
+        self.assertIn("feu", prompts[0])
+
+    @patch("app.services.ai_image.task_artifacts.read_script_data")
+    @patch("app.services.ai_image._generate_response")
+    def test_error_string_response_falls_back(self, mock_llm, mock_script):
+        """_generate_response 失败时返回 "Error: ..." 而非抛异常，必须显式识别。"""
+        mock_script.return_value = {"script": "s", "search_terms": ["feu"]}
+        mock_llm.return_value = "Error: rate limited"
+
+        prompts = ai_image.plan_prompts("task-1", 2)
+
+        self.assertEqual(len(prompts), 2)
+        for prompt in prompts:
+            self.assertNotIn("rate limited", prompt)
+            self.assertIn("symbolique", prompt.lower())
+
+    @patch("app.services.ai_image.task_artifacts.read_script_data")
+    @patch("app.services.ai_image._generate_response")
+    def test_error_string_embedding_json_array_falls_back(self, mock_llm, mock_script):
+        """错误信息里恰好含 JSON 数组时，也不能被当成提示词解析。"""
+        mock_script.return_value = {"script": "s", "search_terms": ["feu"]}
+        mock_llm.return_value = 'Error: invalid payload ["boom"]'
+
+        prompts = ai_image.plan_prompts("task-1", 1)
+
+        self.assertEqual(len(prompts), 1)
+        self.assertNotIn("boom", prompts[0])
+        self.assertIn("feu", prompts[0])
+
+    @patch("app.services.ai_image.task_artifacts.read_script_data")
+    @patch("app.services.ai_image._generate_response")
     def test_prompt_instructs_symbolic_framing(self, mock_llm, mock_script):
         mock_script.return_value = {"script": "s", "search_terms": []}
         mock_llm.return_value = '["a", "b"]'
