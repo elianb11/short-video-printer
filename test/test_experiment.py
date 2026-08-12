@@ -80,6 +80,46 @@ class TestLoadSpec(unittest.TestCase):
         with self.assertRaises(experiment.SpecError):
             experiment.load_spec(_write_spec(self.tmp, bad))
 
+    def test_rejects_empty_grid_axis(self):
+        # 空轴能通过 len(grid) == 1 和数量上限检查，但 expand_variants 会展开出
+        # 零个运行：配置装载成功、却什么都不生成，是最糟糕的失败方式。
+        bad = {**BASE_SPEC, "grid": {"ai_image_style": []}}
+        with self.assertRaises(experiment.SpecError) as ctx:
+            experiment.load_spec(_write_spec(self.tmp, bad))
+        self.assertIn("ai_image_style", str(ctx.exception))
+
+    def test_rejects_non_mapping_base(self):
+        bad = {**BASE_SPEC, "base": "hello"}
+        with self.assertRaises(experiment.SpecError) as ctx:
+            experiment.load_spec(_write_spec(self.tmp, bad))
+        self.assertIn("base", str(ctx.exception))
+
+    def test_rejects_non_mapping_grid(self):
+        bad = {**BASE_SPEC, "grid": "a"}
+        with self.assertRaises(experiment.SpecError) as ctx:
+            experiment.load_spec(_write_spec(self.tmp, bad))
+        self.assertIn("grid", str(ctx.exception))
+
+    def test_rejects_scalar_grid_axis_values(self):
+        # 字符串是真值，len() 数的是字符数：三个字符的字符串甚至能通过数量上限，
+        # 随后按字符展开成变体。必须显式拒绝。
+        bad = {**BASE_SPEC, "grid": {"ai_image_style": "abc"}}
+        with self.assertRaises(experiment.SpecError) as ctx:
+            experiment.load_spec(_write_spec(self.tmp, bad))
+        self.assertIn("ai_image_style", str(ctx.exception))
+
+    def test_rejects_non_numeric_video_count(self):
+        bad = {**BASE_SPEC, "base": {**BASE_SPEC["base"], "video_count": "one"}}
+        with self.assertRaises(experiment.SpecError) as ctx:
+            experiment.load_spec(_write_spec(self.tmp, bad))
+        self.assertIn("video_count", str(ctx.exception))
+
+    def test_rejects_scalar_subjects(self):
+        bad = {**BASE_SPEC, "subjects": "Prométhée"}
+        with self.assertRaises(experiment.SpecError) as ctx:
+            experiment.load_spec(_write_spec(self.tmp, bad))
+        self.assertIn("subjects", str(ctx.exception))
+
     def test_aiimage_spec_requires_pexels_keys_for_fallback(self):
         from app.config import config
 

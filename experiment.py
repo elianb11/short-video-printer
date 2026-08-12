@@ -31,25 +31,59 @@ def load_spec(path: str) -> dict:
         if key not in spec:
             raise SpecError(f"experiment spec is missing required key: {key}")
 
+    # 配置文件由人手写，格式错误属于预期输入而不是异常。逐项校验类型，保证
+    # 调用方只需要捕获 SpecError，而不会收到 AttributeError / TypeError 之类
+    # 带着无用堆栈的内建异常。
     base = spec.get("base") or {}
-    if int(base.get("video_count", 1)) != 1:
+    if not isinstance(base, dict):
+        raise SpecError(
+            f"base must be a mapping of task parameters, got {type(base).__name__}"
+        )
+
+    video_count = base.get("video_count", 1)
+    if isinstance(video_count, bool) or not isinstance(video_count, int):
+        raise SpecError(
+            f"base.video_count must be an integer, got {video_count!r}"
+        )
+    if video_count != 1:
         raise SpecError(
             "base.video_count must be 1 — task.py passes audio_duration * video_count "
             "into download_videos, so a higher count multiplies the image bill"
         )
 
     subjects = spec.get("subjects") or []
+    # 字符串是可迭代的真值，直接放行会按字符展开成一堆单字母主题。
+    if not isinstance(subjects, list):
+        raise SpecError(
+            f"subjects must be a list, got {type(subjects).__name__} — "
+            "a single subject still needs to be written as a one-item list"
+        )
     if not subjects:
         raise SpecError("experiment spec needs at least one subject")
 
     grid = spec.get("grid") or {}
+    if not isinstance(grid, dict):
+        raise SpecError(
+            f"grid must be a mapping of one axis name to its values, "
+            f"got {type(grid).__name__}"
+        )
     if len(grid) != 1:
         raise SpecError(
             f"exactly one grid axis is allowed per round, found {len(grid)} — "
             "more axes than that cannot be resolved at this sample size"
         )
 
-    (values,) = grid.values()
+    ((axis, values),) = grid.items()
+    # 同样的字符串陷阱：len("abc") == 3 能通过下面的数量上限，然后按字符展开。
+    if not isinstance(values, list):
+        raise SpecError(
+            f"grid axis {axis} must be a list of values, got {type(values).__name__}"
+        )
+    if not values:
+        raise SpecError(
+            f"grid axis {axis} has no values, so this round would expand to zero "
+            "runs and generate nothing — give the axis at least one value"
+        )
     if len(values) > MAX_VARIANTS:
         raise SpecError(
             f"grid expands to {len(values)} variants, above the ceiling of {MAX_VARIANTS}"
