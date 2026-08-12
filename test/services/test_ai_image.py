@@ -1,13 +1,17 @@
+import hashlib
+import shutil
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.config import config
 from app.models.schema import VideoAspect
 from app.services import ai_image
+from app.utils import utils
 
 
 class TestAiImageConfig(unittest.TestCase):
@@ -195,3 +199,73 @@ class TestPlanPrompts(unittest.TestCase):
 
         sent = mock_llm.call_args.kwargs.get("prompt") or mock_llm.call_args.args[0]
         self.assertIn("symbolique", sent.lower())
+
+
+class TestGenerateImage(unittest.TestCase):
+    def setUp(self):
+        self.original_app_config = dict(config.app)
+        config.app["gemini_api_key"] = "fake-key"
+        config.app["ai_image_model"] = "imagen-test"
+        self.task_id = f"test-img-{uuid4().hex}"
+
+    def tearDown(self):
+        config.app.clear()
+        config.app.update(self.original_app_config)
+        shutil.rmtree(utils.task_dir(self.task_id), ignore_errors=True)
+
+    def _client_returning(self, image_bytes):
+        generated = MagicMock()
+        generated.image.image_bytes = image_bytes
+        response = MagicMock()
+        response.generated_images = [generated] if image_bytes else []
+        client = MagicMock()
+        client.models.generate_images.return_value = response
+        return client
+
+    def test_cache_path_is_stable_for_same_prompt(self):
+        first = ai_image.image_cache_path(self.task_id, "un titan")
+        second = ai_image.image_cache_path(self.task_id, "un titan")
+        self.assertEqual(first, second)
+        self.assertIn(hashlib.sha256("un titan".encode("utf-8")).hexdigest()[:16], first)
+
+    def test_cache_path_differs_for_different_prompts(self):
+        self.assertNotEqual(
+            ai_image.image_cache_path(self.task_id, "a"),
+            ai_image.image_cache_path(self.task_id, "b"),
+        )
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_writes_image_bytes_to_disk(self, mock_client):
+        mock_client.return_value = self._client_returning(b"JPEGDATA")
+        out_path = ai_image.image_cache_path(self.task_id, "un titan")
+
+        result = ai_image.generate_image("un titan", "9:16", out_path)
+
+        self.assertEqual(result, out_path)
+        self.assertEqual(Path(out_path).read_bytes(), b"JPEGDATA")
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_passes_aspect_ratio_to_api(self, mock_client):
+        client = self._client_returning(b"X")
+        mock_client.return_value = client
+        ai_image.generate_image("p", "9:16", ai_image.image_cache_path(self.task_id, "p"))
+
+        kwargs = client.models.generate_images.call_args.kwargs
+        self.assertEqual(kwargs["model"], "imagen-test")
+        self.assertEqual(kwargs["config"].aspect_ratio, "9:16")
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_empty_result_raises_rai_blocked(self, mock_client):
+        mock_client.return_value = self._client_returning(None)
+
+        with self.assertRaises(ai_image.RaiBlockedError):
+            ai_image.generate_image("gore", "9:16", ai_image.image_cache_path(self.task_id, "gore"))
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_transport_error_is_not_rai_blocked(self, mock_client):
+        client = MagicMock()
+        client.models.generate_images.side_effect = ConnectionError("boom")
+        mock_client.return_value = client
+
+        with self.assertRaises(ConnectionError):
+            ai_image.generate_image("p", "9:16", ai_image.image_cache_path(self.task_id, "p"))

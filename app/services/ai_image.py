@@ -15,8 +15,10 @@ AI 图片素材生成 —— 用 Imagen 生成分镜图，再用 ffmpeg 做 Ken 
     ai_image_fallback_source = "pexels"
 """
 
+import hashlib
 import json
 import math
+import os
 import re
 
 from loguru import logger
@@ -25,6 +27,7 @@ from app.config import config
 from app.models.schema import VideoAspect
 from app.services import task_artifacts
 from app.services.llm import _generate_response
+from app.utils import utils
 
 DEFAULT_MODEL = "imagen-3.0-generate-002"
 DEFAULT_STYLE = (
@@ -161,3 +164,50 @@ def plan_prompts(task_id: str, count: int) -> list[str]:
 
     style = _style()
     return [f"{base}, {style}" for base in bases]
+
+
+class RaiBlockedError(RuntimeError):
+    """模型因安全策略拒绝生成。神话题材容易触发，需要单独区分于网络故障。"""
+
+
+def _imagen_client():
+    # 延迟导入，保持与 llm.py 中 gemini 分支一致的依赖策略。
+    from google import genai
+
+    return genai.Client(api_key=config.app.get("gemini_api_key", ""))
+
+
+def image_cache_path(task_id: str, prompt: str) -> str:
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+    image_dir = os.path.join(utils.task_dir(task_id), "images")
+    os.makedirs(image_dir, exist_ok=True)
+    return os.path.join(image_dir, f"{digest}.jpg")
+
+
+def generate_image(prompt: str, ratio: str, out_path: str) -> str:
+    """生成单张图片并写盘；命中缓存时直接返回。"""
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        logger.info(f"ai image cache hit: {out_path}")
+        return out_path
+
+    from google.genai import types
+
+    client = _imagen_client()
+    response = client.models.generate_images(
+        model=config.app.get("ai_image_model", DEFAULT_MODEL),
+        prompt=prompt,
+        config=types.GenerateImagesConfig(
+            number_of_images=1,
+            aspect_ratio=ratio,
+            output_mime_type="image/jpeg",
+        ),
+    )
+
+    images = getattr(response, "generated_images", None) or []
+    if not images or not getattr(images[0].image, "image_bytes", None):
+        raise RaiBlockedError(f"image generation returned no image for prompt: {prompt[:80]}")
+
+    with open(out_path, "wb") as image_file:
+        image_file.write(images[0].image.image_bytes)
+    logger.success(f"ai image generated: {out_path}")
+    return out_path
