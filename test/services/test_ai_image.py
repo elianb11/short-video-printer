@@ -424,6 +424,27 @@ class TestGenerateClips(unittest.TestCase):
         clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 10.0, 5)
 
         self.assertEqual(clips, [])
+        mock_patch.assert_called_with(self.task_id, ai_image_fallback_beats=2)
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image._fallback_clip")
+    @patch("app.services.ai_image.render_ken_burns")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_fallback_exception_does_not_propagate(
+        self, mock_plan, mock_gen, mock_render, mock_fallback, mock_patch
+    ):
+        """_fallback_clip 里的延迟导入本身可能抛错（Task 8 引入 material 循环依赖），
+        这类异常必须等同于“没有兜底素材”，不能掀翻整条视频。"""
+        mock_plan.return_value = ["p1", "p2"]
+        mock_gen.side_effect = [ai_image.RaiBlockedError("blocked"), "/img2.jpg"]
+        mock_render.side_effect = _render_ok
+        mock_fallback.side_effect = ImportError("circular import")
+
+        clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 10.0, 5)
+
+        self.assertEqual(len(clips), 1)
+        mock_patch.assert_called_with(self.task_id, ai_image_fallback_beats=1)
 
     @patch("app.services.ai_image.task_artifacts.patch_script_data")
     @patch("app.services.ai_image._fallback_clip")

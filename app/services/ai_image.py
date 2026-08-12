@@ -346,7 +346,17 @@ def generate_clips(
             )
 
         fallback_beats += 1
-        fallback = _fallback_clip(task_id, index, video_aspect, duration)
+        # _fallback_clip 内部延迟导入 material，而 material 反过来会导入 ai_image：
+        # 这个导入本身就可能抛 ImportError/AttributeError，不在 _fallback_clip 的
+        # try 覆盖范围内。任何异常都必须降级为“没有兜底素材”，否则单个分镜失败
+        # 会掀翻整条视频——而这正是逐分镜兜底要防的事。
+        try:
+            fallback = _fallback_clip(task_id, index, video_aspect, duration)
+        except Exception as exc:
+            logger.error(
+                f"beat {index} fallback raised: {type(exc).__name__}, detail={exc}"
+            )
+            fallback = None
         if fallback:
             clips.append(fallback)
         else:
