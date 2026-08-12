@@ -1,0 +1,22 @@
+name: myth-fr-round-01
+niche: mythologie
+base:
+  video_language: fr-FR
+  video_source: aiimage
+  video_count: 1
+  video_aspect: "9:16"
+  video_clip_duration: 5
+  paragraph_number: 3
+  subtitle_enabled: true
+  # Replace with a real voice id from voice.get_elevenlabs_voices()
+  voice_name: "elevenlabs:REPLACE_ME:Narrateur"
+subjects:
+  - "Le mythe de Prométhée"
+  - "Pourquoi Cerbère garde les Enfers"
+  - "La malédiction de Sisyphe"
+  - "Le fil d'Ariane et le Minotaure"
+  - "La boîte de Pandore"
+grid:
+  ai_image_style:
+    - "peinture à l'huile cinématographique, clair-obscur dramatique, palette or et bleu profond"
+    - "fresque antique érodée, ocre et terre cuite, lumière rasante"
