@@ -7,13 +7,32 @@
 
 from __future__ import annotations
 
+import argparse
 import itertools
-from typing import Any
+import json
+import os
+import subprocess
+import sys
+import uuid
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Any, Sequence
 
 import yaml
 
 MAX_VARIANTS = 3
 REQUIRED_KEYS = ("name", "base", "subjects", "grid")
+
+DEFAULT_RESULTS_PATH = "experiments/results.jsonl"
+VALID_OUTCOMES = ("hit", "mid", "flop")
+
+# 随仓库发布的示例 spec 带着占位符（例如 voice_name 里的 elevenlabs 声音 id）。
+# load_spec 不校验它：声音 id 是运行期问题，装载期报错会让示例文件根本读不出来。
+# 但 run 必须在第一个子进程之前拦下，否则整轮视频都用坏掉的旁白生成。
+PLACEHOLDER_MARKER = "REPLACE_ME"
+
+# ai_image_* 参数通过 config.toml 生效，不是 cli.py 的入参，因此不映射成命令行标志。
+_NON_CLI_PREFIXES = ("ai_image_",)
 
 
 class SpecError(ValueError):
@@ -130,3 +149,240 @@ def expand_variants(spec: dict) -> list[dict[str, Any]]:
             "params": {**base, **variant},
         })
     return runs
+
+
+def build_cli_argv(run: dict, task_id: str) -> list[str]:
+    argv = [sys.executable, "cli.py", "--task-id", task_id,
+            "--video-subject", run["subject"]]
+
+    for key, value in (run.get("params") or {}).items():
+        if key.startswith(_NON_CLI_PREFIXES):
+            continue
+        flag = "--" + key.replace("_", "-")
+        if isinstance(value, bool):
+            # cli.py 的布尔开关都用 BooleanOptionalAction，且部分默认为真
+            # （subtitle_enabled）。False 若不发出任何参数，spec 写的关闭就会被
+            # 默认值悄悄翻回打开：视频与记录里的变体不一致，整轮归因作废。
+            argv.append(flag if value else f"--no-{key.replace('_', '-')}")
+            continue
+        argv.extend([flag, str(value)])
+    return argv
+
+
+def _placeholder_errors(spec: dict) -> list[str]:
+    """找出仍带占位符的参数值。"""
+    candidates: list[tuple[str, Any]] = list((spec.get("base") or {}).items())
+    candidates.extend(("subjects", subject) for subject in spec.get("subjects") or [])
+    for axis, values in (spec.get("grid") or {}).items():
+        candidates.extend((axis, value) for value in values)
+
+    return [
+        f"{key} still contains the {PLACEHOLDER_MARKER} placeholder: {value!r}"
+        for key, value in candidates
+        if isinstance(value, str) and PLACEHOLDER_MARKER in value
+    ]
+
+
+def preflight_errors(spec: dict) -> list[str]:
+    """
+    返回生成前必须修复的问题；空列表表示可以开跑。
+
+    load_spec 只保证 spec 自身合法，以及 aiimage 的**兜底**路径可用
+    （pexels_api_keys）。主路径的前置条件没人检查：ai_image.is_enabled() 为假时
+    每个分镜都会静默降级成图库素材——用户照样拿到视频，但那不是 AI 图片视频，
+    这一轮实验什么也没测到。和占位符一样，必须在烧掉第一份 Imagen 额度前报错。
+    """
+    errors = _placeholder_errors(spec)
+
+    if (spec.get("base") or {}).get("video_source") == "aiimage":
+        from app.config import config
+        from app.services import ai_image
+
+        if not ai_image.is_enabled():
+            if not config.app.get("ai_image_enabled", False):
+                errors.append(
+                    "video_source=aiimage requires ai_image_enabled = true in "
+                    "config.toml — otherwise every beat silently falls back to stock "
+                    "footage and the round measures nothing"
+                )
+            if not config.app.get("gemini_api_key", ""):
+                errors.append(
+                    "video_source=aiimage requires gemini_api_key in config.toml — "
+                    "Imagen cannot be reached without it and every beat would fall "
+                    "back to stock footage"
+                )
+            if not errors:
+                errors.append(
+                    "video_source=aiimage but ai_image.is_enabled() is false; "
+                    "check the [app] ai_image settings in config.toml"
+                )
+
+    return errors
+
+
+def record_result(results_path: str, record: dict) -> None:
+    os.makedirs(os.path.dirname(results_path) or ".", exist_ok=True)
+    with open(results_path, "a", encoding="utf-8") as results_file:
+        results_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_results(results_path: str) -> list[dict]:
+    if not os.path.exists(results_path):
+        return []
+    records = []
+    with open(results_path, "r", encoding="utf-8") as results_file:
+        for line in results_file:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def _rewrite_results(results_path: str, records: list[dict]) -> None:
+    with open(results_path, "w", encoding="utf-8") as results_file:
+        for record in records:
+            results_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def mark_outcome(results_path: str, key: str, outcome: str) -> bool:
+    records = load_results(results_path)
+    matched = False
+    for record in records:
+        # 标题恒存在但可能是空字符串（llm.generate_social_metadata 的兜底分支）。
+        # 空标题不能当匹配键，否则一次 mark 会把所有标题为空的记录一起改掉。
+        by_title = bool(key) and record.get("title") == key
+        if record.get("task_id") == key or by_title:
+            record["outcome"] = outcome
+            matched = True
+    if matched:
+        _rewrite_results(results_path, records)
+    return matched
+
+
+def build_report(records: list[dict]) -> str:
+    arms: dict[str, list[dict]] = defaultdict(list)
+    excluded = 0
+    for record in records:
+        if record.get("fallback_beats", 0) > 0:
+            excluded += 1
+            continue
+        arm = ", ".join(f"{k}={v}" for k, v in sorted((record.get("variant") or {}).items()))
+        arms[arm or "(no variant)"].append(record)
+
+    lines = []
+    for arm, arm_records in sorted(arms.items()):
+        tally: dict[str, int] = defaultdict(int)
+        for record in arm_records:
+            tally[record.get("outcome") or "unrated"] += 1
+        summary = "  ".join(f"{name}={count}" for name, count in sorted(tally.items()))
+        lines.append(f"{arm}\n    n={len(arm_records)}  {summary}")
+
+    lines.append(f"\n{excluded} sample(s) excluded for fallback_beats > 0 (contaminated).")
+    lines.append(
+        "At this sample size, only a stark difference is meaningful. "
+        "A narrow gap is noise — re-run rather than act on it."
+    )
+    return "\n".join(lines)
+
+
+def run_experiment(spec_path: str, results_path: str = DEFAULT_RESULTS_PATH) -> int:
+    from app.services import task_artifacts
+
+    try:
+        spec = load_spec(spec_path)
+    except SpecError as exc:
+        # 配置错误是预期输入，堆栈对用户没有信息量。
+        print(f"invalid experiment spec {spec_path}: {exc}")
+        return 2
+    except (OSError, yaml.YAMLError) as exc:
+        print(f"cannot read experiment spec {spec_path}: {exc}")
+        return 2
+
+    errors = preflight_errors(spec)
+    if errors:
+        print(f"refusing to run {spec.get('name', spec_path)}:")
+        for error in errors:
+            print(f"  - {error}")
+        return 2
+
+    runs = expand_variants(spec)
+    print(f"{spec['name']}: {len(runs)} video(s) to generate")
+
+    failures = 0
+    for index, run in enumerate(runs, start=1):
+        task_id = str(uuid.uuid4())
+        argv = build_cli_argv(run, task_id)
+        print(f"\n[{index}/{len(runs)}] {run['subject']} | {run['variant']}")
+
+        completed = subprocess.run(argv)
+        script_data = task_artifacts.read_script_data(task_id) or {}
+        metadata = script_data.get("social_metadata") or {}
+        # 标题这个键总是存在，失败时是空字符串而不是缺键，所以判空值而不是判缺键。
+        title = metadata.get("title") or ""
+
+        record_result(results_path, {
+            "task_id": task_id,
+            "experiment": spec["name"],
+            "niche": spec.get("niche", ""),
+            "variant": run["variant"],
+            "subject": run["subject"],
+            "title": title,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "fallback_beats": script_data.get("ai_image_fallback_beats", 0),
+            "succeeded": completed.returncode == 0,
+            "outcome": None,
+        })
+
+        if not title:
+            # 人工反馈靠发布标题查回记录，标题为空时只能用 task_id。
+            print(f"  no published title recorded — mark this one by task_id {task_id}")
+
+        if completed.returncode != 0:
+            failures += 1
+            print(f"  variant failed (exit {completed.returncode}) — continuing batch")
+
+    print(f"\nDone. Results appended to {results_path}")
+    if failures:
+        # 批次里有失败就不能报成功退出：这条命令每天跑两三次，静默的 0
+        # 会让用户以为素材都拿到了。
+        print(f"{failures}/{len(runs)} variant(s) failed")
+        return 1
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="MoneyPrinterTurbo experiment runner")
+    parser.add_argument("--results", default=DEFAULT_RESULTS_PATH)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = sub.add_parser("run", help="generate and publish every variant in a spec")
+    run_parser.add_argument("spec")
+
+    mark_parser = sub.add_parser("mark", help="record a manual outcome for a published video")
+    mark_parser.add_argument("key", help="task_id or published title")
+    mark_parser.add_argument("--outcome", required=True, choices=VALID_OUTCOMES)
+
+    report_parser = sub.add_parser("report", help="summarise outcomes per variant arm")
+    report_parser.add_argument("experiment")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "run":
+        return run_experiment(args.spec, args.results)
+    if args.command == "mark":
+        if mark_outcome(args.results, args.key, args.outcome):
+            print(f"marked {args.key} as {args.outcome}")
+            return 0
+        print(f"no record found for: {args.key}")
+        return 1
+
+    records = [r for r in load_results(args.results) if r.get("experiment") == args.experiment]
+    if not records:
+        print(f"no records for experiment: {args.experiment}")
+        return 1
+    print(build_report(records))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
