@@ -1,5 +1,6 @@
 import hashlib
 import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -216,8 +217,21 @@ class TestGenerateImage(unittest.TestCase):
     def _client_returning(self, image_bytes):
         generated = MagicMock()
         generated.image.image_bytes = image_bytes
+        # 真实 SDK 在没有被拦截时把该字段留空；显式置 None 让报错信息可预测。
+        generated.rai_filtered_reason = None
         response = MagicMock()
         response.generated_images = [generated] if image_bytes else []
+        client = MagicMock()
+        client.models.generate_images.return_value = response
+        return client
+
+    def _client_rai_filtered(self, reason):
+        """模拟安全过滤：有条目、没有图片、带拒绝原因。"""
+        generated = MagicMock()
+        generated.image = None
+        generated.rai_filtered_reason = reason
+        response = MagicMock()
+        response.generated_images = [generated]
         client = MagicMock()
         client.models.generate_images.return_value = response
         return client
@@ -260,6 +274,90 @@ class TestGenerateImage(unittest.TestCase):
 
         with self.assertRaises(ai_image.RaiBlockedError):
             ai_image.generate_image("gore", "9:16", ai_image.image_cache_path(self.task_id, "gore"))
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_requests_the_rai_reason(self, mock_client):
+        # 没有 include_rai_reason，被拦截时返回的只是一个空列表，
+        # "提示词太血腥" 和 "模型 id 写错 / 该 key 没开通 Imagen" 长得完全一样。
+        client = self._client_returning(b"X")
+        mock_client.return_value = client
+        ai_image.generate_image("p", "9:16", ai_image.image_cache_path(self.task_id, "p"))
+
+        config_arg = client.models.generate_images.call_args.kwargs["config"]
+        self.assertTrue(config_arg.include_rai_reason)
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_rai_reason_reaches_the_error_message(self, mock_client):
+        mock_client.return_value = self._client_rai_filtered(
+            "Blocked by Responsible AI filters: violence"
+        )
+
+        with self.assertRaises(ai_image.RaiBlockedError) as ctx:
+            ai_image.generate_image(
+                "gore", "9:16", ai_image.image_cache_path(self.task_id, "gore")
+            )
+        self.assertIn("Responsible AI filters: violence", str(ctx.exception))
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_missing_rai_reason_points_at_configuration(self, mock_client):
+        # 一个原因都没有，通常意味着请求本身没成立（模型 id / key 未开通），
+        # 而不是安全过滤——日志必须把这条岔路说出来。
+        mock_client.return_value = self._client_returning(None)
+
+        with self.assertRaises(ai_image.RaiBlockedError) as ctx:
+            ai_image.generate_image("p", "9:16", ai_image.image_cache_path(self.task_id, "p"))
+        message = str(ctx.exception)
+        self.assertIn("ai_image_model", message)
+        self.assertIn("no rai reason", message.lower())
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_interrupted_write_leaves_no_poisoned_cache_entry(self, mock_client):
+        # 缓存只认"存在且非空"，一次中途中断写出的半张图会被之后每一次运行当成
+        # 命中，并以一条无从解释的 ffmpeg 解码错误把该分镜永久降级成图库素材。
+        mock_client.return_value = self._client_returning(b"JPEGDATA")
+        out_path = ai_image.image_cache_path(self.task_id, "un titan")
+
+        with patch("app.services.ai_image.os.replace",
+                   side_effect=KeyboardInterrupt("ctrl-c")):
+            with self.assertRaises(KeyboardInterrupt):
+                ai_image.generate_image("un titan", "9:16", out_path)
+
+        self.assertFalse(Path(out_path).exists())
+        # 临时文件也不能留在缓存目录里。
+        self.assertEqual(list(Path(out_path).parent.iterdir()), [])
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_failed_write_leaves_no_cache_file(self, mock_client):
+        # 写入本身失败（磁盘满、字节流损坏）同样不得留下任何缓存条目。
+        mock_client.return_value = self._client_returning(object())
+        out_path = ai_image.image_cache_path(self.task_id, "un titan")
+
+        with self.assertRaises(TypeError):
+            ai_image.generate_image("un titan", "9:16", out_path)
+
+        self.assertFalse(Path(out_path).exists())
+        self.assertEqual(list(Path(out_path).parent.iterdir()), [])
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_successful_write_leaves_no_temp_files(self, mock_client):
+        mock_client.return_value = self._client_returning(b"JPEGDATA")
+        out_path = ai_image.image_cache_path(self.task_id, "un titan")
+
+        ai_image.generate_image("un titan", "9:16", out_path)
+
+        self.assertEqual([child.name for child in Path(out_path).parent.iterdir()],
+                         [Path(out_path).name])
+
+    @patch("app.services.ai_image._imagen_client")
+    def test_cache_hit_skips_the_api_call(self, mock_client):
+        client = self._client_returning(b"JPEGDATA")
+        mock_client.return_value = client
+        out_path = ai_image.image_cache_path(self.task_id, "un titan")
+        Path(out_path).write_bytes(b"CACHED")
+
+        self.assertEqual(ai_image.generate_image("un titan", "9:16", out_path), out_path)
+        client.models.generate_images.assert_not_called()
+        self.assertEqual(Path(out_path).read_bytes(), b"CACHED")
 
     @patch("app.services.ai_image._imagen_client")
     def test_transport_error_is_not_rai_blocked(self, mock_client):
@@ -438,6 +536,28 @@ class TestKenBurns(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ai_image.render_ken_burns("/in.jpg", "/out.mp4", 5, "zoom_in", 1080, 1920)
 
+    @patch("app.services.ai_image.subprocess.run")
+    def test_passes_a_timeout_to_ffmpeg(self, mock_run):
+        # 没有超时，一个卡死的 ffmpeg 会让整批无人值守的生成永远挂着。
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        ai_image.render_ken_burns("/in.jpg", "/out.mp4", 5, "zoom_in", 1080, 1920)
+
+        self.assertEqual(mock_run.call_args.kwargs["timeout"],
+                         ai_image.FFMPEG_TIMEOUT_SECONDS)
+        # 一段 5 秒片段实测约 3.5 秒，上限必须明显宽裕。
+        self.assertGreaterEqual(ai_image.FFMPEG_TIMEOUT_SECONDS, 60)
+
+    @patch("app.services.ai_image.subprocess.run")
+    def test_timeout_becomes_the_same_runtime_error(self, mock_run):
+        # 与非零退出走同一条 RuntimeError 路径，调用方才能把该分镜降级，
+        # 而不是让 TimeoutExpired 掀翻整条流水线。
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="ffmpeg", timeout=300)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            ai_image.render_ken_burns("/in.jpg", "/out.mp4", 5, "zoom_in", 1080, 1920)
+        self.assertIn("timed out", str(ctx.exception))
+
 
 def _render_ok(image_path, out_path, *args, **kwargs):
     """模拟一次成功的渲染：真实的 ffmpeg 会落盘一个非空文件。"""
@@ -470,7 +590,65 @@ class TestGenerateClips(unittest.TestCase):
 
         self.assertEqual(len(clips), 3)
         self.assertEqual(mock_gen.call_count, 3)
-        mock_patch.assert_called_with(self.task_id, ai_image_fallback_beats=0)
+        mock_patch.assert_called_with(
+            self.task_id, ai_image_beats=3, ai_image_fallback_beats=0
+        )
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image._fallback_clip")
+    @patch("app.services.ai_image.render_ken_burns")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_returns_nothing_when_ai_image_is_disabled(
+        self, mock_plan, mock_gen, mock_render, mock_fallback, mock_patch
+    ):
+        # material.download_videos 只按 video_source 派发，不看这个开关：不在这里
+        # 拦截的话，`cli.py --video-source aiimage` 会在开关关闭时照样计费。
+        # 返回空列表让 task.get_video_materials 把任务判失败——响亮胜过静默花钱。
+        config.app["ai_image_enabled"] = False
+
+        clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 15.0, 5)
+
+        self.assertEqual(clips, [])
+        mock_plan.assert_not_called()
+        mock_gen.assert_not_called()
+        mock_render.assert_not_called()
+        mock_fallback.assert_not_called()
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_returns_nothing_without_a_gemini_key(self, mock_plan, mock_gen, mock_patch):
+        config.app["gemini_api_key"] = ""
+
+        self.assertEqual(
+            ai_image.generate_clips(self.task_id, VideoAspect.portrait, 15.0, 5), []
+        )
+        # 提示词规划本身也要 LLM 调用，必须在它之前就停下。
+        mock_plan.assert_not_called()
+        mock_gen.assert_not_called()
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image._fallback_clip")
+    @patch("app.services.ai_image.subprocess.run")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_ffmpeg_timeout_degrades_the_beat_to_fallback(
+        self, mock_plan, mock_gen, mock_run, mock_fallback, mock_patch
+    ):
+        # 真实的 render_ken_burns 在这里执行：卡死的 ffmpeg 必须变成一次降级，
+        # 而不是让 TimeoutExpired 逃出去掀翻整批生成。
+        mock_plan.return_value = ["p1"]
+        mock_gen.side_effect = lambda prompt, ratio, out: out
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="ffmpeg", timeout=300)
+        mock_fallback.return_value = "/stock.mp4"
+
+        clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 5.0, 5)
+
+        self.assertEqual(clips, ["/stock.mp4"])
+        mock_patch.assert_called_with(
+            self.task_id, ai_image_beats=1, ai_image_fallback_beats=1
+        )
 
     @patch("app.services.ai_image.task_artifacts.patch_script_data")
     @patch("app.services.ai_image.render_ken_burns")
@@ -518,7 +696,9 @@ class TestGenerateClips(unittest.TestCase):
 
         self.assertEqual(len(clips), 2)
         self.assertIn("/stock.mp4", clips)
-        mock_patch.assert_called_with(self.task_id, ai_image_fallback_beats=1)
+        mock_patch.assert_called_with(
+            self.task_id, ai_image_beats=2, ai_image_fallback_beats=1
+        )
 
     @patch("app.services.ai_image.task_artifacts.patch_script_data")
     @patch("app.services.ai_image._fallback_clip")
@@ -535,7 +715,9 @@ class TestGenerateClips(unittest.TestCase):
         clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 10.0, 5)
 
         self.assertEqual(clips, [])
-        mock_patch.assert_called_with(self.task_id, ai_image_fallback_beats=2)
+        mock_patch.assert_called_with(
+            self.task_id, ai_image_beats=2, ai_image_fallback_beats=2
+        )
 
     @patch("app.services.ai_image.task_artifacts.patch_script_data")
     @patch("app.services.ai_image._fallback_clip")
@@ -555,7 +737,9 @@ class TestGenerateClips(unittest.TestCase):
         clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 10.0, 5)
 
         self.assertEqual(len(clips), 1)
-        mock_patch.assert_called_with(self.task_id, ai_image_fallback_beats=1)
+        mock_patch.assert_called_with(
+            self.task_id, ai_image_beats=2, ai_image_fallback_beats=1
+        )
 
     @patch("app.services.ai_image.task_artifacts.patch_script_data")
     @patch("app.services.ai_image._fallback_clip")
@@ -590,7 +774,9 @@ class TestGenerateClips(unittest.TestCase):
         clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 5.0, 5)
 
         self.assertEqual(clips, ["/stock.mp4"])
-        mock_patch.assert_called_with(self.task_id, ai_image_fallback_beats=1)
+        mock_patch.assert_called_with(
+            self.task_id, ai_image_beats=1, ai_image_fallback_beats=1
+        )
 
     @patch("app.services.ai_image.task_artifacts.patch_script_data")
     @patch("app.services.ai_image._fallback_clip")

@@ -21,6 +21,7 @@ import math
 import os
 import re
 import subprocess
+import tempfile
 
 from loguru import logger
 
@@ -222,8 +223,65 @@ def image_cache_path(task_id: str, prompt: str) -> str:
     return os.path.join(image_dir, f"{digest}.jpg")
 
 
+def _rai_reason(images) -> str:
+    """
+    汇总模型给出的 RAI 拒绝原因。
+
+    空结果有两种完全不同的成因：提示词被安全策略拦下（神话题材的核心风险），
+    或者模型 id 写错、该 key 没开通 Imagen。日志若不能区分，第一次付费运行
+    就只剩一条"没有图片"，无从下手。因此请求时带上 include_rai_reason，
+    并把返回的原因写进异常信息。
+    """
+    reasons = [
+        str(reason)
+        for reason in (getattr(image, "rai_filtered_reason", None) for image in images)
+        if isinstance(reason, str) and reason.strip()
+    ]
+    if reasons:
+        return "; ".join(reasons)
+    return (
+        "no rai reason returned — the request itself may have failed: "
+        "check ai_image_model and that Imagen is enabled for this API key"
+    )
+
+
+def _write_image_atomic(out_path: str, payload: bytes) -> None:
+    """
+    先写同目录临时文件再 ``os.replace``，避免中断留下半张图。
+
+    缓存只检查"文件存在且非空"，一次 Ctrl-C 写坏的半张图会被之后每一次运行
+    当成命中，并以一条无从解释的 ffmpeg 解码错误把该分镜静默降级成图库素材，
+    而且再也不会自愈。临时文件必须与目标同目录，``os.replace`` 才有原子替换
+    语义（与 task_artifacts._write_json_atomic 同一模式）。
+    """
+    directory = os.path.dirname(out_path) or "."
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=directory,
+            prefix=f".{os.path.basename(out_path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(payload)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        os.replace(temp_path, out_path)
+        temp_path = None
+    finally:
+        # 替换成功前目标文件一字未动；失败时只清理本次的临时文件。
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
 def generate_image(prompt: str, ratio: str, out_path: str) -> str:
-    """生成单张图片并写盘；命中缓存时直接返回。"""
+    """生成单张图片并原子写盘；命中缓存时直接返回。"""
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         logger.info(f"ai image cache hit: {out_path}")
         return out_path
@@ -238,15 +296,19 @@ def generate_image(prompt: str, ratio: str, out_path: str) -> str:
             number_of_images=1,
             aspect_ratio=ratio,
             output_mime_type="image/jpeg",
+            # 没有它，被拦截时返回的只是一个空列表，安全过滤和配置错误长得一模一样。
+            include_rai_reason=True,
         ),
     )
 
     images = getattr(response, "generated_images", None) or []
     if not images or not getattr(images[0].image, "image_bytes", None):
-        raise RaiBlockedError(f"image generation returned no image for prompt: {prompt[:80]}")
+        raise RaiBlockedError(
+            f"image generation returned no image for prompt: {prompt[:80]} "
+            f"| rai_reason: {_rai_reason(images)}"
+        )
 
-    with open(out_path, "wb") as image_file:
-        image_file.write(images[0].image.image_bytes)
+    _write_image_atomic(out_path, images[0].image.image_bytes)
     logger.success(f"ai image generated: {out_path}")
     return out_path
 
@@ -255,6 +317,8 @@ def generate_image(prompt: str, ratio: str, out_path: str) -> str:
 # 先放大到 4 倍再 zoompan，可以避免 zoompan 在整数像素上取整造成的抖动。
 _FPS = 30
 _SUPERSAMPLE = 4
+# 单次 ffmpeg 渲染的超时上限，见 render_ken_burns。
+FFMPEG_TIMEOUT_SECONDS = 300
 
 
 def pick_motion(index: int) -> str:
@@ -298,7 +362,17 @@ def render_ken_burns(
         "-pix_fmt", "yuv420p", "-r", str(_FPS),
         out_path,
     ]
-    completed = subprocess.run(argv, capture_output=True, text=True)
+    # 一段 5 秒片段实测约 3.5 秒，300 秒足够宽裕；没有超时的话，一个卡死的
+    # ffmpeg 会让整批无人值守的生成永远挂着，而不是降级成图库素材继续跑完。
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        # 与非零退出走同一条 RuntimeError 路径，调用方据此把该分镜降级。
+        raise RuntimeError(
+            f"ffmpeg ken burns timed out after {FFMPEG_TIMEOUT_SECONDS}s: {image_path}"
+        ) from exc
     if completed.returncode != 0:
         raise RuntimeError(
             f"ffmpeg ken burns failed (exit {completed.returncode}): {completed.stderr[-500:]}"
@@ -347,6 +421,18 @@ def generate_clips(
     单个分镜失败不得中断整条流水线：先退回图库素材，连图库也拿不到时丢弃该
     分镜，其余片段照常交付。渲染耗 CPU（4 倍超采样），因此按顺序执行。
     """
+    # ai_image_enabled 是计费闸门，必须在运行期这一层生效。
+    # material.download_videos 只按 video_source 派发、不看这个开关，所以
+    # `cli.py --video-source aiimage` 在开关关闭时照样会调用 Imagen 并计费。
+    # 返回空列表让 task.get_video_materials 直接把任务判失败——响亮地失败，
+    # 好过静默地花钱，也好过静默地全量降级成图库素材。
+    if not is_enabled():
+        logger.error(
+            "ai image generation is disabled (ai_image_enabled=false or "
+            f"gemini_api_key missing), returning no clips: task_id={task_id}"
+        )
+        return []
+
     count = beat_count(audio_duration, clip_duration)
     ratio = aspect_ratio(video_aspect)
     width, height = resolution(video_aspect)
@@ -399,9 +485,22 @@ def generate_clips(
         else:
             logger.error(f"beat {index} dropped: fallback unavailable")
 
-    task_artifacts.patch_script_data(task_id, ai_image_fallback_beats=fallback_beats)
+    # 计划分镜数与降级数一起记录：只有 fallback_beats 时，"7 个分镜降级 1 个"
+    # 和"模型 id 写错、7 个全降级"在记录里是同一种东西，而后者意味着这条视频
+    # 里根本没有 AI 图片，整个变体测的不是它标称的那个变量。
+    task_artifacts.patch_script_data(
+        task_id,
+        ai_image_beats=count,
+        ai_image_fallback_beats=fallback_beats,
+    )
     logger.info(
         f"ai image clips ready: task_id={task_id}, clips={len(clips)}, "
-        f"fallback_beats={fallback_beats}"
+        f"beats={count}, fallback_beats={fallback_beats}"
     )
+    if count and fallback_beats >= count:
+        logger.error(
+            f"every beat fell back to stock footage: task_id={task_id}, beats={count} "
+            "— this video contains no AI imagery; check ai_image_model, the API key "
+            "and the safety-filter warnings above"
+        )
     return clips
