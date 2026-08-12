@@ -269,3 +269,60 @@ class TestGenerateImage(unittest.TestCase):
 
         with self.assertRaises(ConnectionError):
             ai_image.generate_image("p", "9:16", ai_image.image_cache_path(self.task_id, "p"))
+
+
+class TestKenBurns(unittest.TestCase):
+    def setUp(self):
+        self.original_app_config = dict(config.app)
+
+    def tearDown(self):
+        config.app.clear()
+        config.app.update(self.original_app_config)
+
+    def test_pick_motion_uses_configured_value(self):
+        config.app["ai_image_motion"] = "zoom_in"
+        self.assertEqual(ai_image.pick_motion(0), "zoom_in")
+        self.assertEqual(ai_image.pick_motion(3), "zoom_in")
+
+    def test_pick_motion_cycles_when_random(self):
+        config.app["ai_image_motion"] = "random"
+        picked = [ai_image.pick_motion(i) for i in range(len(ai_image.MOTIONS) + 1)]
+        self.assertEqual(len(set(picked)), len(ai_image.MOTIONS))
+        self.assertEqual(picked[0], picked[len(ai_image.MOTIONS)])
+
+    def test_invalid_motion_falls_back_to_zoom_in(self):
+        config.app["ai_image_motion"] = "nonsense"
+        self.assertEqual(ai_image.pick_motion(0), "zoom_in")
+
+    @patch("app.services.ai_image.subprocess.run")
+    def test_builds_zoompan_command_with_output_size(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        result = ai_image.render_ken_burns("/in.jpg", "/out.mp4", 5, "zoom_in", 1080, 1920)
+
+        self.assertEqual(result, "/out.mp4")
+        argv = mock_run.call_args.args[0]
+        self.assertEqual(argv[0], "ffmpeg")
+        self.assertIn("/in.jpg", argv)
+        self.assertIn("/out.mp4", argv)
+        filter_arg = argv[argv.index("-vf") + 1]
+        self.assertIn("zoompan", filter_arg)
+        self.assertIn("1080x1920", filter_arg)
+
+    @patch("app.services.ai_image.subprocess.run")
+    def test_zoom_out_differs_from_zoom_in(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+        ai_image.render_ken_burns("/in.jpg", "/out.mp4", 5, "zoom_in", 1080, 1920)
+        zoom_in_filter = mock_run.call_args.args[0][mock_run.call_args.args[0].index("-vf") + 1]
+
+        ai_image.render_ken_burns("/in.jpg", "/out.mp4", 5, "zoom_out", 1080, 1920)
+        zoom_out_filter = mock_run.call_args.args[0][mock_run.call_args.args[0].index("-vf") + 1]
+
+        self.assertNotEqual(zoom_in_filter, zoom_out_filter)
+
+    @patch("app.services.ai_image.subprocess.run")
+    def test_nonzero_exit_raises(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="bad input")
+
+        with self.assertRaises(RuntimeError):
+            ai_image.render_ken_burns("/in.jpg", "/out.mp4", 5, "zoom_in", 1080, 1920)

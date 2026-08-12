@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import subprocess
 
 from loguru import logger
 
@@ -210,4 +211,59 @@ def generate_image(prompt: str, ratio: str, out_path: str) -> str:
     with open(out_path, "wb") as image_file:
         image_file.write(images[0].image.image_bytes)
     logger.success(f"ai image generated: {out_path}")
+    return out_path
+
+
+# zoompan 逐帧推进 zoom/x/y。'on' 是输出帧序号，总帧数 = duration * FPS。
+# 先放大到 4 倍再 zoompan，可以避免 zoompan 在整数像素上取整造成的抖动。
+_FPS = 30
+_SUPERSAMPLE = 4
+
+
+def pick_motion(index: int) -> str:
+    configured = str(config.app.get("ai_image_motion", "random")).strip().lower()
+    if configured == "random":
+        return MOTIONS[index % len(MOTIONS)]
+    if configured not in MOTIONS:
+        logger.warning(f"unknown ai_image_motion={configured}, using zoom_in")
+        return "zoom_in"
+    return configured
+
+
+def _zoompan_expr(motion: str, frames: int) -> tuple[str, str, str]:
+    """返回 (zoom, x, y) 三个 zoompan 表达式。"""
+    if motion == "zoom_in":
+        return (f"min(1+0.25*on/{frames},1.25)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)")
+    if motion == "zoom_out":
+        return (f"max(1.25-0.25*on/{frames},1.0)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)")
+    if motion == "pan_left":
+        return ("1.15", f"(iw-iw/zoom)*(1-on/{frames})", "ih/2-(ih/zoom/2)")
+    return ("1.15", f"(iw-iw/zoom)*(on/{frames})", "ih/2-(ih/zoom/2)")
+
+
+def render_ken_burns(
+    image_path: str, out_path: str, duration: int, motion: str, width: int, height: int
+) -> str:
+    frames = max(int(duration) * _FPS, 1)
+    zoom, pan_x, pan_y = _zoompan_expr(motion, frames)
+    video_filter = (
+        f"scale={width * _SUPERSAMPLE}:{height * _SUPERSAMPLE},"
+        f"zoompan=z='{zoom}':x='{pan_x}':y='{pan_y}':"
+        f"d={frames}:s={width}x{height}:fps={_FPS},"
+        f"format=yuv420p"
+    )
+    # -hide_banner: 编译信息有 ~370 字节，会把真正的报错挤出下面 stderr[-500:] 的窗口。
+    argv = [
+        "ffmpeg", "-hide_banner", "-y", "-loop", "1", "-i", image_path,
+        "-t", str(duration),
+        "-vf", video_filter,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-r", str(_FPS),
+        out_path,
+    ]
+    completed = subprocess.run(argv, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg ken burns failed (exit {completed.returncode}): {completed.stderr[-500:]}"
+        )
     return out_path
