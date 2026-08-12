@@ -69,6 +69,12 @@ twelvelabs_rerank_terms = false
 # is ALSO required: blocked or failed beats fall back to a stock clip so the
 # video still ships.
 #
+# ai_image_enabled = false makes ai_image return NO clips, which fails the task
+# at the materials stage rather than silently billing Imagen or degrading to
+# stock footage. Also set video_concat_mode = "sequential" (experiment.py
+# requires it): image beats are planned in narrative order and the default
+# random mode shuffles them.
+#
 # Environment overrides: every ai_image_* setting below EXCEPT ai_image_enabled
 # is also read from MPT_<UPPERCASE_NAME> (ai_image_style -> MPT_AI_IMAGE_STYLE),
 # which takes precedence over the value here. experiment.py sets them per variant

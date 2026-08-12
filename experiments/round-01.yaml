@@ -6,6 +6,9 @@ base:
   video_count: 1
   video_aspect: "9:16"
   video_clip_duration: 5
+  # Required with video_source: aiimage — beats are planned in narrative order
+  # and the default (random) shuffles them, telling the myth out of order.
+  video_concat_mode: sequential
   paragraph_number: 3
   subtitle_enabled: true
   # Replace with a real voice id from voice.get_elevenlabs_voices()

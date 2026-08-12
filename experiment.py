@@ -41,9 +41,45 @@ _NON_CLI_PREFIXES = ("ai_image_",)
 # 否则超长标题永远匹配不上 mark。
 PUBLISHED_TITLE_MAX = 100
 
+AIIMAGE_SOURCE = "aiimage"
+# AI 图片的分镜是按叙事顺序规划的（plan_prompts 一次性看完整脚本才排得出这个
+# 顺序），generate_clips 也按序返回。而 video_concat_mode 默认是 random，
+# video.py 会把片段打乱——神话就被讲乱了。aiimage 只能配顺序拼接。
+REQUIRED_CONCAT_MODE = "sequential"
+
 
 class SpecError(ValueError):
     """实验配置不合法。"""
+
+
+def _grid_values(grid: Any, axis: str) -> list:
+    """取某个网格轴的取值列表；轴不存在或类型不对时返回空列表。"""
+    if not isinstance(grid, dict):
+        return []
+    values = grid.get(axis)
+    return list(values) if isinstance(values, list) else []
+
+
+def _declared_values(base: Any, grid: Any, key: str) -> list:
+    """一个参数在 spec 里的全部取值来源：base 里写死的，加上网格轴上的。"""
+    values = []
+    if isinstance(base, dict) and key in base:
+        values.append(base[key])
+    values.extend(_grid_values(grid, key))
+    return values
+
+
+def uses_aiimage(base: Any, grid: Any) -> bool:
+    """
+    spec 是否会以 aiimage 生成——base 写死的和网格轴上的都算。
+
+    只看 base 是不够的：``grid: {video_source: [aiimage, pexels]}``（"AI 图片
+    对比图库素材"）是最顺理成章的第二轮实验，而这样一条 spec 会绕过全部
+    aiimage 校验——pexels key 检查、兜底源的无限递归防护、以及生成前的
+    ai_image_enabled 前置检查，也就是重新打开前面三个提交刚关上的
+    无限递归与计费风险。
+    """
+    return AIIMAGE_SOURCE in _declared_values(base, grid, "video_source")
 
 
 def load_spec(path: str) -> dict:
@@ -133,8 +169,29 @@ def load_spec(path: str) -> dict:
                 f"Varyable ai_image settings: {allowed}"
             )
 
-    if base.get("video_source") == "aiimage":
+    if uses_aiimage(base, grid):
         from app.config import config
+
+        # 分镜是按叙事顺序生成的，拼接却默认随机：schema.py 的默认值是 random，
+        # cli.py 不传就是 None，video.py 于是把片段打乱，神话被讲乱了。
+        # 显式要求写出来而不是悄悄注入默认值，spec 才能自证它测的是什么。
+        concat_modes = _declared_values(base, grid, "video_concat_mode")
+        if not concat_modes:
+            raise SpecError(
+                f"video_source={AIIMAGE_SOURCE} requires an explicit "
+                f'video_concat_mode: "{REQUIRED_CONCAT_MODE}" in base — AI image '
+                "beats are planned in narrative order, and the default (random) "
+                "shuffles them, so the myth is told out of order"
+            )
+        wrong = [mode for mode in concat_modes if mode != REQUIRED_CONCAT_MODE]
+        if wrong:
+            raise SpecError(
+                f"video_source={AIIMAGE_SOURCE} requires "
+                f'video_concat_mode = "{REQUIRED_CONCAT_MODE}", got {wrong!r} — '
+                "AI image beats are narrative-ordered (plan_prompts makes one LLM "
+                "call over the whole script precisely to order them), and any other "
+                "mode shuffles the clips into the wrong story order"
+            )
 
         # AI 图片的兜底路径走图库下载，没有 key 时被安全策略拦截的分镜会直接失败。
         # 与其跑到一半才崩，不如在装载配置时就拒绝。
@@ -152,10 +209,10 @@ def load_spec(path: str) -> dict:
         # 该配置现在也经 _setting 读取，spec 的 base 和网格轴都能通过环境变量
         # 覆盖它，因此三个来源都要查，不能只看 config.toml。
         fallback_sources = [config.app.get("ai_image_fallback_source", "pexels")]
-        if "ai_image_fallback_source" in base:
-            fallback_sources.append(base["ai_image_fallback_source"])
-        fallback_sources.extend(grid.get("ai_image_fallback_source") or [])
-        if "aiimage" in fallback_sources:
+        fallback_sources.extend(
+            _declared_values(base, grid, "ai_image_fallback_source")
+        )
+        if AIIMAGE_SOURCE in fallback_sources:
             raise SpecError(
                 'ai_image_fallback_source must not be "aiimage" — the fallback value '
                 "is passed straight back into material.download_videos, which "
@@ -243,12 +300,12 @@ def preflight_errors(spec: dict) -> list[str]:
 
     load_spec 只保证 spec 自身合法，以及 aiimage 的**兜底**路径可用
     （pexels_api_keys）。主路径的前置条件没人检查：ai_image.is_enabled() 为假时
-    每个分镜都会静默降级成图库素材——用户照样拿到视频，但那不是 AI 图片视频，
-    这一轮实验什么也没测到。和占位符一样，必须在烧掉第一份 Imagen 额度前报错。
+    generate_clips 会直接返回空列表，每个变体都会在素材阶段失败——整批跑完
+    一无所获。和占位符一样，必须在起第一个子进程前报错。
     """
     errors = _placeholder_errors(spec)
 
-    if (spec.get("base") or {}).get("video_source") == "aiimage":
+    if uses_aiimage(spec.get("base") or {}, spec.get("grid") or {}):
         from app.config import config
         from app.services import ai_image
 
@@ -256,14 +313,14 @@ def preflight_errors(spec: dict) -> list[str]:
             if not config.app.get("ai_image_enabled", False):
                 errors.append(
                     "video_source=aiimage requires ai_image_enabled = true in "
-                    "config.toml — otherwise every beat silently falls back to stock "
-                    "footage and the round measures nothing"
+                    "config.toml — ai_image.generate_clips returns no clips while it "
+                    "is false, so every variant fails at the materials stage"
                 )
             if not config.app.get("gemini_api_key", ""):
                 errors.append(
                     "video_source=aiimage requires gemini_api_key in config.toml — "
-                    "Imagen cannot be reached without it and every beat would fall "
-                    "back to stock footage"
+                    "Imagen cannot be reached without it, so ai_image is disabled and "
+                    "every variant fails at the materials stage"
                 )
             if not errors:
                 errors.append(
@@ -403,6 +460,11 @@ def run_experiment(spec_path: str, results_path: str = DEFAULT_RESULTS_PATH) -> 
         # 截断到发布端的长度，否则超长标题在 YouTube 上显示的是截断版，
         # 而 mark 用完整版做精确匹配，永远对不上。
         title = (metadata.get("title") or "")[:PUBLISHED_TITLE_MAX]
+        # 分镜总数和降级数必须一起记录：只有降级数时，"7 个降级 1 个"和"模型 id
+        # 写错、7 个全降级"在 results.jsonl 里是同一种东西，而后者代表这条视频
+        # 里一张 AI 图片都没有，标称的变量根本没被测到。
+        beats = script_data.get("ai_image_beats", 0)
+        fallback_beats = script_data.get("ai_image_fallback_beats", 0)
 
         record_result(results_path, {
             "task_id": task_id,
@@ -412,10 +474,19 @@ def run_experiment(spec_path: str, results_path: str = DEFAULT_RESULTS_PATH) -> 
             "subject": run["subject"],
             "title": title,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "fallback_beats": script_data.get("ai_image_fallback_beats", 0),
+            "beats": beats,
+            "fallback_beats": fallback_beats,
             "succeeded": completed.returncode == 0,
             "outcome": None,
         })
+
+        if beats and fallback_beats >= beats:
+            print(
+                f"  WARNING: all {beats} beat(s) fell back to stock footage — this "
+                "video contains no AI imagery, so it measures nothing about "
+                "this arm. Check ai_image_model, the API key, and the safety "
+                "filter warnings in the log above."
+            )
 
         if not title:
             # 人工反馈靠发布标题查回记录，标题为空时只能用 task_id。

@@ -27,6 +27,8 @@ BASE_SPEC = {
         "video_source": "aiimage",
         "video_count": 1,
         "video_clip_duration": 5,
+        # aiimage 的分镜按叙事顺序生成，随机拼接会把神话讲乱，load_spec 强制要求。
+        "video_concat_mode": "sequential",
     },
     "subjects": ["Prométhée", "Cerbère", "Sisyphe"],
     "grid": {"ai_image_style": ["style-a", "style-b"]},
@@ -199,6 +201,88 @@ class TestLoadSpec(unittest.TestCase):
                 with self.assertRaises(experiment.SpecError) as ctx:
                     experiment.load_spec(_write_spec(self.tmp, spec))
                 self.assertIn("recursion", str(ctx.exception).lower())
+
+    def test_requires_sequential_concat_mode_for_aiimage(self):
+        # plan_prompts 之所以对整篇脚本只做一次 LLM 调用，就是为了让分镜按叙事
+        # 顺序排列；video_concat_mode 默认 random 会把它们打乱，神话被讲乱。
+        for mode in ("random", "shuffle"):
+            with self.subTest(mode=mode):
+                bad = {**BASE_SPEC,
+                       "base": {**BASE_SPEC["base"], "video_concat_mode": mode}}
+                with self.assertRaises(experiment.SpecError) as ctx:
+                    experiment.load_spec(_write_spec(self.tmp, bad))
+                self.assertIn("video_concat_mode", str(ctx.exception))
+
+    def test_requires_concat_mode_to_be_declared_explicitly(self):
+        base = {k: v for k, v in BASE_SPEC["base"].items() if k != "video_concat_mode"}
+        bad = {**BASE_SPEC, "base": base}
+        with self.assertRaises(experiment.SpecError) as ctx:
+            experiment.load_spec(_write_spec(self.tmp, bad))
+        self.assertIn("video_concat_mode", str(ctx.exception))
+
+    def test_rejects_random_concat_mode_declared_on_a_grid_axis(self):
+        bad = {**BASE_SPEC, "grid": {"video_concat_mode": ["sequential", "random"]}}
+        with self.assertRaises(experiment.SpecError) as ctx:
+            experiment.load_spec(_write_spec(self.tmp, bad))
+        self.assertIn("video_concat_mode", str(ctx.exception))
+
+    def test_non_aiimage_spec_may_use_any_concat_mode(self):
+        local = {**BASE_SPEC,
+                 "base": {**BASE_SPEC["base"], "video_source": "local",
+                          "video_concat_mode": "random"}}
+        self.assertEqual(
+            experiment.load_spec(_write_spec(self.tmp, local))["name"],
+            "myth-fr-round-01",
+        )
+
+    def test_video_source_grid_axis_does_not_bypass_the_aiimage_checks(self):
+        # "AI 图片 vs 图库素材" 是最顺理成章的第二轮实验，而这条 spec 的
+        # base 里没有 aiimage：只看 base 的旧检查会整块跳过，重新打开
+        # 无限递归和计费风险。两扇门都必须走同一套校验。
+        from app.config import config
+
+        grid_spec = {
+            **BASE_SPEC,
+            "base": {k: v for k, v in BASE_SPEC["base"].items() if k != "video_source"},
+            "grid": {"video_source": ["aiimage", "pexels"]},
+        }
+        # 门 1：兜底源指回 aiimage（无限递归）。
+        original = dict(config.app)
+        try:
+            config.app["ai_image_fallback_source"] = "aiimage"
+            with self.assertRaises(experiment.SpecError) as ctx:
+                experiment.load_spec(_write_spec(self.tmp, grid_spec))
+            self.assertIn("recursion", str(ctx.exception).lower())
+        finally:
+            config.app.clear()
+            config.app.update(original)
+
+        # 门 2：兜底路径缺 pexels key。
+        original = dict(config.app)
+        try:
+            config.app["pexels_api_keys"] = []
+            with self.assertRaises(experiment.SpecError) as ctx:
+                experiment.load_spec(_write_spec(self.tmp, grid_spec))
+            self.assertIn("pexels", str(ctx.exception).lower())
+        finally:
+            config.app.clear()
+            config.app.update(original)
+
+        # 门 3：顺序拼接同样必须显式声明。
+        no_concat = {
+            **grid_spec,
+            "base": {k: v for k, v in grid_spec["base"].items()
+                     if k != "video_concat_mode"},
+        }
+        with self.assertRaises(experiment.SpecError) as ctx:
+            experiment.load_spec(_write_spec(self.tmp, no_concat))
+        self.assertIn("video_concat_mode", str(ctx.exception))
+
+        # 三个前置条件都满足时，这条 spec 本身是合法的。
+        self.assertEqual(
+            experiment.load_spec(_write_spec(self.tmp, grid_spec))["name"],
+            "myth-fr-round-01",
+        )
 
     def test_non_aiimage_spec_ignores_fallback_source(self):
         from app.config import config
@@ -503,6 +587,22 @@ class TestRunPreflight(_RunExperimentTestCase):
         self.assertEqual(code, 0)
         self.assertTrue(mock_run.called)
 
+    def test_video_source_grid_axis_still_requires_ai_image_enabled(self):
+        # 前置检查曾只看 base["video_source"]，一条 video_source 网格轴就能整块
+        # 绕过它，然后每个 aiimage 分支都在素材阶段失败。
+        from app.config import config
+
+        config.app["ai_image_enabled"] = False
+        spec = {
+            **BASE_SPEC,
+            "base": {k: v for k, v in BASE_SPEC["base"].items() if k != "video_source"},
+            "grid": {"video_source": ["aiimage", "pexels"]},
+        }
+        code, mock_run = self._run(spec)
+
+        self.assertEqual(code, 2)
+        mock_run.assert_not_called()
+
     def test_reports_spec_error_without_traceback(self):
         bad = {**BASE_SPEC, "grid": {"ai_image_style": []}}
         code, mock_run = self._run(bad)
@@ -539,6 +639,62 @@ class TestRunExperiment(_RunExperimentTestCase):
         self.assertTrue(records[0]["succeeded"])
         self.assertIsNone(records[0]["outcome"])
         self.assertTrue(records[0]["task_id"])
+
+    def test_records_the_beat_total_next_to_the_fallback_count(self):
+        # 只记降级数时，"7 个降级 1 个"和"7 个全降级"在记录里无法区分，
+        # 而后者代表这条视频里一张 AI 图片都没有。
+        script_data = {
+            "social_metadata": {"title": "Le mythe", "description": "d", "tags": []},
+            "ai_image_beats": 7,
+            "ai_image_fallback_beats": 1,
+        }
+        with patch("experiment.subprocess.run", return_value=self._completed()), \
+                patch("app.services.task_artifacts.read_script_data", return_value=script_data):
+            experiment.run_experiment(self._spec_path(self.SPEC), self.results)
+
+        record = experiment.load_results(self.results)[0]
+        self.assertEqual(record["beats"], 7)
+        self.assertEqual(record["fallback_beats"], 1)
+
+    def test_warns_when_every_beat_fell_back(self):
+        script_data = {
+            "social_metadata": {"title": "Le mythe", "description": "d", "tags": []},
+            "ai_image_beats": 7,
+            "ai_image_fallback_beats": 7,
+        }
+        with patch("experiment.subprocess.run", return_value=self._completed()), \
+                patch("app.services.task_artifacts.read_script_data", return_value=script_data), \
+                patch("builtins.print") as mock_print:
+            experiment.run_experiment(self._spec_path(self.SPEC), self.results)
+
+        printed = " ".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
+        self.assertIn("no AI imagery", printed)
+        self.assertIn("7", printed)
+
+    def test_does_not_warn_when_some_beats_survived(self):
+        script_data = {
+            "social_metadata": {"title": "Le mythe", "description": "d", "tags": []},
+            "ai_image_beats": 7,
+            "ai_image_fallback_beats": 6,
+        }
+        with patch("experiment.subprocess.run", return_value=self._completed()), \
+                patch("app.services.task_artifacts.read_script_data", return_value=script_data), \
+                patch("builtins.print") as mock_print:
+            experiment.run_experiment(self._spec_path(self.SPEC), self.results)
+
+        printed = " ".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
+        self.assertNotIn("no AI imagery", printed)
+
+    def test_missing_beat_total_does_not_warn(self):
+        # 非 aiimage 的运行不会写入 ai_image_beats，缺席不能被读成"全部降级"。
+        with patch("experiment.subprocess.run", return_value=self._completed()), \
+                patch("app.services.task_artifacts.read_script_data", return_value=None), \
+                patch("builtins.print") as mock_print:
+            experiment.run_experiment(self._spec_path(self.SPEC), self.results)
+
+        printed = " ".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
+        self.assertNotIn("no AI imagery", printed)
+        self.assertEqual(experiment.load_results(self.results)[0]["beats"], 0)
 
     def test_passes_generated_task_id_to_the_subprocess(self):
         with patch("experiment.subprocess.run", return_value=self._completed()) as mock_run, \
