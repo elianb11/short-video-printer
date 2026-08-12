@@ -766,6 +766,17 @@ def download_videos(
     max_clip_duration: int = 5,
     match_script_order: bool = False,
 ) -> List[str]:
+    if source == "aiimage":
+        # 延迟导入避免 ai_image -> material 的循环依赖。
+        from app.services import ai_image
+
+        return ai_image.generate_clips(
+            task_id=task_id,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            clip_duration=max_clip_duration,
+        )
+
     provider = "pexels"
     remote_search_videos = search_videos_pexels
     if source == "pixabay":

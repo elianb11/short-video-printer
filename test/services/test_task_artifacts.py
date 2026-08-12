@@ -1,11 +1,14 @@
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 from app.models.schema import VideoParams
 from app.services import task_artifacts
+from app.utils import utils
 
 
 class TestTaskArtifacts(unittest.TestCase):
@@ -95,6 +98,32 @@ class TestTaskArtifacts(unittest.TestCase):
         self.assertFalse(updated)
         self.assertEqual(target.read_text(encoding="utf-8"), "{invalid-json")
         self.assertTrue(warning.called)
+
+
+class TestReadScriptData(unittest.TestCase):
+    def setUp(self):
+        self.task_id = f"test-read-{uuid4().hex}"
+
+    def tearDown(self):
+        shutil.rmtree(utils.task_dir(self.task_id), ignore_errors=True)
+
+    def test_returns_payload_written_by_write_script_data(self):
+        payload = {"script": "Prométhée vola le feu.", "search_terms": ["feu", "titan"]}
+        task_artifacts.write_script_data(self.task_id, payload)
+
+        result = task_artifacts.read_script_data(self.task_id)
+
+        self.assertEqual(result["script"], "Prométhée vola le feu.")
+        self.assertEqual(result["search_terms"], ["feu", "titan"])
+
+    def test_returns_none_when_file_missing(self):
+        self.assertIsNone(task_artifacts.read_script_data("nonexistent-task-id"))
+
+    def test_returns_none_on_corrupt_json(self):
+        target = Path(utils.task_dir(self.task_id)) / "script.json"
+        target.write_text("{not valid json", encoding="utf-8")
+
+        self.assertIsNone(task_artifacts.read_script_data(self.task_id))
 
 
 if __name__ == "__main__":

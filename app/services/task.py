@@ -876,6 +876,9 @@ def _run_cross_post(
                 "privacyStatus": youtube_privacy_status,
                 "containsSyntheticMedia": True,
             }
+            # 发布标题由 LLM 生成且只发送给 Upload-Post，进程结束后无法回溯。
+            # 实验流程需要用它把已发布视频对应回生成参数，因此落盘保存。
+            task_artifacts.patch_script_data(task_id, social_metadata=metadata)
 
         for video_path in video_paths:
             result = upload_post.cross_post_video(

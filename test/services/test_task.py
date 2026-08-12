@@ -12,6 +12,7 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.services import task as tm
+from app.services import task_artifacts
 from app.models.schema import MaterialInfo, VideoParams
 from app.services.state import MemoryState, RedisState
 from app.utils import utils
@@ -1583,7 +1584,51 @@ class TestTaskService(unittest.TestCase):
         )
         result = tm.start(task_id=task_id, params=params)
         print(result)
-    
+
+
+class TestCrossPostPersistsSocialMetadata(unittest.TestCase):
+    def setUp(self):
+        self.task_id = f"test-meta-{uuid4().hex}"
+        task_artifacts.write_script_data(self.task_id, {"script": "s", "search_terms": []})
+
+    def tearDown(self):
+        shutil.rmtree(utils.task_dir(self.task_id), ignore_errors=True)
+
+    @patch("app.services.task.upload_post.cross_post_video")
+    @patch("app.services.task.llm.generate_social_metadata")
+    def test_youtube_metadata_is_written_to_script_json(self, mock_meta, mock_post):
+        mock_meta.return_value = {
+            "title": "Le mythe de Prométhée",
+            "caption": "Le titan qui défia les dieux.",
+            "hashtags": ["#mythologie", "#grece"],
+        }
+        mock_post.return_value = {"success": True, "request_id": "req-1"}
+
+        # 任务不存在时 _run_cross_post 会在调用第三方接口前直接返回，
+        # 因此先在内存状态中登记任务，让发布流程真正执行到元数据生成。
+        state = MemoryState()
+        state.update_task(
+            self.task_id,
+            state=tm.const.TASK_STATE_COMPLETE,
+            progress=100,
+            cross_post_state=tm.const.CROSS_POST_STATE_PENDING,
+        )
+
+        with patch.object(tm.sm, "state", state):
+            tm._run_cross_post(
+                task_id=self.task_id,
+                video_paths=("/tmp/fake.mp4",),
+                video_subject="Prométhée",
+                video_script="s",
+                video_language="fr-FR",
+                platforms=("youtube",),
+                youtube_privacy_status="public",
+            )
+
+        saved = task_artifacts.read_script_data(self.task_id)
+        self.assertEqual(saved["social_metadata"]["title"], "Le mythe de Prométhée")
+        self.assertEqual(saved["social_metadata"]["hashtags"], ["#mythologie", "#grece"])
+
 
 if __name__ == "__main__":
     unittest.main()
