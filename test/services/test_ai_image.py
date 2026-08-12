@@ -326,3 +326,191 @@ class TestKenBurns(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             ai_image.render_ken_burns("/in.jpg", "/out.mp4", 5, "zoom_in", 1080, 1920)
+
+
+def _render_ok(image_path, out_path, *args, **kwargs):
+    """模拟一次成功的渲染：真实的 ffmpeg 会落盘一个非空文件。"""
+    Path(out_path).write_bytes(b"MP4DATA")
+    return out_path
+
+
+class TestGenerateClips(unittest.TestCase):
+    def setUp(self):
+        self.original_app_config = dict(config.app)
+        config.app["gemini_api_key"] = "fake-key"
+        config.app["ai_image_enabled"] = True
+        self.task_id = f"test-clips-{uuid4().hex}"
+
+    def tearDown(self):
+        config.app.clear()
+        config.app.update(self.original_app_config)
+        shutil.rmtree(utils.task_dir(self.task_id), ignore_errors=True)
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image.render_ken_burns")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_returns_one_clip_per_beat(self, mock_plan, mock_gen, mock_render, mock_patch):
+        mock_plan.return_value = ["p1", "p2", "p3"]
+        mock_gen.side_effect = lambda prompt, ratio, out: out
+        mock_render.side_effect = _render_ok
+
+        clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 15.0, 5)
+
+        self.assertEqual(len(clips), 3)
+        self.assertEqual(mock_gen.call_count, 3)
+        mock_patch.assert_called_with(self.task_id, ai_image_fallback_beats=0)
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image.render_ken_burns")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_clip_paths_are_unique_per_beat(self, mock_plan, mock_gen, mock_render, mock_patch):
+        """提示词可能重复（缓存命中），输出路径必须按分镜序号区分。"""
+        mock_plan.return_value = ["same", "same"]
+        mock_gen.side_effect = lambda prompt, ratio, out: out
+        mock_render.side_effect = _render_ok
+
+        clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 10.0, 5)
+
+        self.assertEqual(len(set(clips)), 2)
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image.render_ken_burns")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_render_receives_integer_duration(self, mock_plan, mock_gen, mock_render, mock_patch):
+        """render_ken_burns 用 int(duration) 算帧数却把原值传给 -t，浮点会让运镜中途重启。"""
+        mock_plan.return_value = ["p1"]
+        mock_gen.side_effect = lambda prompt, ratio, out: out
+        mock_render.side_effect = _render_ok
+
+        ai_image.generate_clips(self.task_id, VideoAspect.portrait, 5.0, 5.0)
+
+        duration = mock_render.call_args.args[2]
+        self.assertIsInstance(duration, int)
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image._fallback_clip")
+    @patch("app.services.ai_image.render_ken_burns")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_blocked_beat_falls_back_to_stock(
+        self, mock_plan, mock_gen, mock_render, mock_fallback, mock_patch
+    ):
+        mock_plan.return_value = ["p1", "p2"]
+        mock_gen.side_effect = [ai_image.RaiBlockedError("blocked"), "/img2.jpg"]
+        mock_render.side_effect = _render_ok
+        mock_fallback.return_value = "/stock.mp4"
+
+        clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 10.0, 5)
+
+        self.assertEqual(len(clips), 2)
+        self.assertIn("/stock.mp4", clips)
+        mock_patch.assert_called_with(self.task_id, ai_image_fallback_beats=1)
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image._fallback_clip")
+    @patch("app.services.ai_image.render_ken_burns")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_beat_is_dropped_when_fallback_also_fails(
+        self, mock_plan, mock_gen, mock_render, mock_fallback, mock_patch
+    ):
+        mock_plan.return_value = ["p1", "p2"]
+        mock_gen.side_effect = ai_image.RaiBlockedError("blocked")
+        mock_fallback.return_value = None
+
+        clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 10.0, 5)
+
+        self.assertEqual(clips, [])
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image._fallback_clip")
+    @patch("app.services.ai_image.render_ken_burns")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_network_error_also_falls_back(
+        self, mock_plan, mock_gen, mock_render, mock_fallback, mock_patch
+    ):
+        mock_plan.return_value = ["p1"]
+        mock_gen.side_effect = ConnectionError("down")
+        mock_fallback.return_value = "/stock.mp4"
+
+        self.assertEqual(
+            ai_image.generate_clips(self.task_id, VideoAspect.portrait, 5.0, 5), ["/stock.mp4"]
+        )
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image._fallback_clip")
+    @patch("app.services.ai_image.render_ken_burns")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_empty_render_output_falls_back(
+        self, mock_plan, mock_gen, mock_render, mock_fallback, mock_patch
+    ):
+        """duration=0 时 ffmpeg 以退出码 0 产出空文件：不抛异常不等于片段可用。"""
+        mock_plan.return_value = ["p1"]
+        mock_gen.side_effect = lambda prompt, ratio, out: out
+        mock_render.side_effect = lambda img, out, *a, **k: (Path(out).write_bytes(b""), out)[1]
+        mock_fallback.return_value = "/stock.mp4"
+
+        clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 5.0, 5)
+
+        self.assertEqual(clips, ["/stock.mp4"])
+        mock_patch.assert_called_with(self.task_id, ai_image_fallback_beats=1)
+
+    @patch("app.services.ai_image.task_artifacts.patch_script_data")
+    @patch("app.services.ai_image._fallback_clip")
+    @patch("app.services.ai_image.render_ken_burns")
+    @patch("app.services.ai_image.generate_image")
+    @patch("app.services.ai_image.plan_prompts")
+    def test_missing_render_output_falls_back(
+        self, mock_plan, mock_gen, mock_render, mock_fallback, mock_patch
+    ):
+        mock_plan.return_value = ["p1"]
+        mock_gen.side_effect = lambda prompt, ratio, out: out
+        mock_render.side_effect = lambda img, out, *a, **k: out
+        mock_fallback.return_value = "/stock.mp4"
+
+        clips = ai_image.generate_clips(self.task_id, VideoAspect.portrait, 5.0, 5)
+
+        self.assertEqual(clips, ["/stock.mp4"])
+
+
+class TestFallbackClip(unittest.TestCase):
+    def setUp(self):
+        self.original_app_config = dict(config.app)
+        self.task_id = f"test-fallback-{uuid4().hex}"
+
+    def tearDown(self):
+        config.app.clear()
+        config.app.update(self.original_app_config)
+        shutil.rmtree(utils.task_dir(self.task_id), ignore_errors=True)
+
+    @patch("app.services.ai_image.task_artifacts.read_script_data")
+    def test_returns_none_without_search_terms(self, mock_script):
+        mock_script.return_value = {"search_terms": []}
+        self.assertIsNone(
+            ai_image._fallback_clip(self.task_id, 0, VideoAspect.portrait, 5)
+        )
+
+    @patch("app.services.material.download_videos")
+    @patch("app.services.ai_image.task_artifacts.read_script_data")
+    def test_returns_none_when_download_raises(self, mock_script, mock_download):
+        mock_script.return_value = {"search_terms": ["feu"]}
+        mock_download.side_effect = RuntimeError("api down")
+        self.assertIsNone(
+            ai_image._fallback_clip(self.task_id, 0, VideoAspect.portrait, 5)
+        )
+
+    @patch("app.services.material.download_videos")
+    @patch("app.services.ai_image.task_artifacts.read_script_data")
+    def test_returns_first_downloaded_path(self, mock_script, mock_download):
+        mock_script.return_value = {"search_terms": ["feu", "titan"]}
+        mock_download.return_value = ["/stock-a.mp4", "/stock-b.mp4"]
+
+        self.assertEqual(
+            ai_image._fallback_clip(self.task_id, 1, VideoAspect.portrait, 5), "/stock-a.mp4"
+        )
+        self.assertEqual(mock_download.call_args.kwargs["search_terms"], ["titan"])

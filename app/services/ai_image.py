@@ -267,3 +267,94 @@ def render_ken_burns(
             f"ffmpeg ken burns failed (exit {completed.returncode}): {completed.stderr[-500:]}"
         )
     return out_path
+
+
+def _fallback_clip(task_id: str, index: int, video_aspect, clip_duration: int) -> str | None:
+    """
+    单个分镜失败时退回图库素材，保证成片仍能交付。
+
+    这里延迟导入 material，避免 material -> ai_image -> material 的循环导入。
+    """
+    from app.services import material
+
+    script_data = task_artifacts.read_script_data(task_id) or {}
+    terms = [str(term) for term in script_data.get("search_terms", []) if term]
+    if not terms:
+        logger.warning(f"no search terms available for fallback: task_id={task_id}")
+        return None
+
+    term = terms[index % len(terms)]
+    try:
+        paths = material.download_videos(
+            task_id=task_id,
+            search_terms=[term],
+            source=config.app.get("ai_image_fallback_source", "pexels"),
+            video_aspect=video_aspect,
+            audio_duration=float(clip_duration),
+            max_clip_duration=clip_duration,
+        )
+    except Exception as exc:
+        logger.error(
+            f"fallback material download failed: task_id={task_id}, "
+            f"term={term}, error={type(exc).__name__}, detail={exc}"
+        )
+        return None
+    return paths[0] if paths else None
+
+
+def generate_clips(
+    task_id: str, video_aspect, audio_duration: float, clip_duration: int
+) -> list[str]:
+    """生成整条时间线的 AI 图片片段，返回值与 download_videos 一致。
+
+    单个分镜失败不得中断整条流水线：先退回图库素材，连图库也拿不到时丢弃该
+    分镜，其余片段照常交付。渲染耗 CPU（4 倍超采样），因此按顺序执行。
+    """
+    count = beat_count(audio_duration, clip_duration)
+    ratio = aspect_ratio(video_aspect)
+    width, height = resolution(video_aspect)
+    # render_ken_burns 用 int(duration) 算帧数却把原值传给 -t，浮点会让运镜中途重启。
+    duration = int(clip_duration)
+    prompts = plan_prompts(task_id, count)
+
+    clip_dir = os.path.join(utils.task_dir(task_id), "images")
+    os.makedirs(clip_dir, exist_ok=True)
+
+    clips: list[str] = []
+    fallback_beats = 0
+
+    for index, prompt in enumerate(prompts):
+        try:
+            image_path = generate_image(prompt, ratio, image_cache_path(task_id, prompt))
+            # 输出路径按分镜序号命名：提示词可能重复（缓存命中），
+            # 若按图片路径派生，两个分镜会互相覆盖。
+            clip_path = os.path.join(clip_dir, f"beat-{index:02d}.mp4")
+            rendered = render_ken_burns(
+                image_path, clip_path, duration, pick_motion(index), width, height
+            )
+            # ffmpeg 遇到 duration=0 之类的输入会以退出码 0 产出空文件，
+            # 没有抛异常并不代表片段可用，必须校验落盘结果。
+            if not rendered or not os.path.exists(rendered) or os.path.getsize(rendered) <= 0:
+                raise RuntimeError(f"ken burns produced an empty clip: {rendered}")
+            clips.append(rendered)
+            continue
+        except RaiBlockedError as exc:
+            logger.warning(f"beat {index} blocked by safety filter: {exc}")
+        except Exception as exc:
+            logger.error(
+                f"beat {index} generation failed: {type(exc).__name__}, detail={exc}"
+            )
+
+        fallback_beats += 1
+        fallback = _fallback_clip(task_id, index, video_aspect, duration)
+        if fallback:
+            clips.append(fallback)
+        else:
+            logger.error(f"beat {index} dropped: fallback unavailable")
+
+    task_artifacts.patch_script_data(task_id, ai_image_fallback_beats=fallback_beats)
+    logger.info(
+        f"ai image clips ready: task_id={task_id}, clips={len(clips)}, "
+        f"fallback_beats={fallback_beats}"
+    )
+    return clips
