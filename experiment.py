@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -31,8 +32,14 @@ VALID_OUTCOMES = ("hit", "mid", "flop")
 # 但 run 必须在第一个子进程之前拦下，否则整轮视频都用坏掉的旁白生成。
 PLACEHOLDER_MARKER = "REPLACE_ME"
 
-# ai_image_* 参数通过 config.toml 生效，不是 cli.py 的入参，因此不映射成命令行标志。
+# ai_image_* 参数通过 config.toml 生效，不是 cli.py 的入参，因此不映射成命令行标志，
+# 改为经环境变量传给子进程（见 build_subprocess_env）。
 _NON_CLI_PREFIXES = ("ai_image_",)
+
+# upload_post 发布到 YouTube 时会把标题截断到 100 字符（upload_post.py:64）。
+# results.jsonl 里存的是人工回查用的键，必须与用户在 YouTube 上看到的完全一致，
+# 否则超长标题永远匹配不上 mark。
+PUBLISHED_TITLE_MAX = 100
 
 
 class SpecError(ValueError):
@@ -169,6 +176,28 @@ def build_cli_argv(run: dict, task_id: str) -> list[str]:
     return argv
 
 
+def build_subprocess_env(run: dict) -> dict[str, str]:
+    """
+    把不走命令行的参数转成子进程环境变量。
+
+    build_cli_argv 会跳过 ``ai_image_*``：它们只能从 config.toml 读。但整台机器
+    共用同一个 config.toml，若不另行传递，网格里所有分支都会用同一个风格生成，
+    而 results.jsonl 却把它们标成不同分支——正是这个文件存在的意义所在被推翻。
+    ai_image._setting 因此优先读取 ``MPT_<KEY大写>``。
+
+    键从 run["params"] 通用推导，所以将来新增 ai_image_motion 之类的轴无需改动
+    此处；用 params 而不是 variant，是为了让 base 里写死的 ai_image_* 同样生效。
+    这样每个参数要么变成命令行标志，要么变成环境变量，不存在被静默丢弃的项。
+    """
+    from app.services.ai_image import ENV_SETTING_PREFIX
+
+    return {
+        ENV_SETTING_PREFIX + key.upper(): str(value)
+        for key, value in (run.get("params") or {}).items()
+        if key.startswith(_NON_CLI_PREFIXES)
+    }
+
+
 def _placeholder_errors(spec: dict) -> list[str]:
     """找出仍带占位符的参数值。"""
     candidates: list[tuple[str, Any]] = list((spec.get("base") or {}).items())
@@ -239,9 +268,37 @@ def load_results(results_path: str) -> list[dict]:
 
 
 def _rewrite_results(results_path: str, records: list[dict]) -> None:
-    with open(results_path, "w", encoding="utf-8") as results_file:
-        for record in records:
-            results_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    """
+    原子重写结果文件：先写同目录临时文件，再 os.replace 覆盖。
+
+    ``open(path, "w")`` 会先截断再写。中途崩溃、磁盘写满或被中断，就会留下一个
+    半截或空的 results.jsonl —— 而人工评级按定义无法重跑，用户手输的判断只存在
+    于这个文件里。临时文件必须与目标同目录，os.replace 才能保证原子替换语义
+    （与 task_artifacts._write_json_atomic 同一模式）。
+    """
+    directory = os.path.dirname(results_path) or "."
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=directory,
+            prefix=f".{os.path.basename(results_path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+            for record in records:
+                temp_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        os.replace(temp_path, results_path)
+        temp_path = None
+    finally:
+        # 替换成功前原文件一字未动；失败时只清理本次的临时文件。
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def mark_outcome(results_path: str, key: str, outcome: str) -> bool:
@@ -314,11 +371,13 @@ def run_experiment(spec_path: str, results_path: str = DEFAULT_RESULTS_PATH) -> 
         argv = build_cli_argv(run, task_id)
         print(f"\n[{index}/{len(runs)}] {run['subject']} | {run['variant']}")
 
-        completed = subprocess.run(argv)
+        completed = subprocess.run(argv, env={**os.environ, **build_subprocess_env(run)})
         script_data = task_artifacts.read_script_data(task_id) or {}
         metadata = script_data.get("social_metadata") or {}
         # 标题这个键总是存在，失败时是空字符串而不是缺键，所以判空值而不是判缺键。
-        title = metadata.get("title") or ""
+        # 截断到发布端的长度，否则超长标题在 YouTube 上显示的是截断版，
+        # 而 mark 用完整版做精确匹配，永远对不上。
+        title = (metadata.get("title") or "")[:PUBLISHED_TITLE_MAX]
 
         record_result(results_path, {
             "task_id": task_id,

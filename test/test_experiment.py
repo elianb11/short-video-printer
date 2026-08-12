@@ -1,3 +1,5 @@
+import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -233,6 +235,42 @@ class TestBuildCliArgv(unittest.TestCase):
         argv = experiment.build_cli_argv(run, "t")
         self.assertNotIn("--ai-image-style", argv)
 
+    def test_cli_accepts_the_aiimage_video_source(self):
+        # build_cli_argv 发出 --video-source aiimage；若 cli.py 的 choices 不含它，
+        # argparse 会在做任何事之前退出 2，整个实验一个视频也生成不出来。
+        import cli
+
+        args = cli.parse_args(["--video-subject", "s", "--video-source", "aiimage"])
+        self.assertEqual(args.video_source, "aiimage")
+
+
+class TestBuildSubprocessEnv(unittest.TestCase):
+    """ai_image_* 不是命令行参数，只能靠环境变量按变体区分子进程。"""
+
+    def test_ai_image_params_become_env_overrides(self):
+        run = {"subject": "s", "variant": {"ai_image_style": "style-a"},
+               "params": {"ai_image_style": "style-a", "video_source": "aiimage"}}
+        env = experiment.build_subprocess_env(run)
+        self.assertEqual(env, {"MPT_AI_IMAGE_STYLE": "style-a"})
+
+    def test_future_axes_need_no_code_change(self):
+        run = {"subject": "s", "variant": {"ai_image_motion": "pan_left"},
+               "params": {"ai_image_motion": "pan_left", "ai_image_model": "m"}}
+        env = experiment.build_subprocess_env(run)
+        self.assertEqual(env,
+                         {"MPT_AI_IMAGE_MOTION": "pan_left", "MPT_AI_IMAGE_MODEL": "m"})
+
+    def test_cli_params_are_not_duplicated_into_the_environment(self):
+        run = {"subject": "s", "variant": {}, "params": {"video_clip_duration": 5}}
+        self.assertEqual(experiment.build_subprocess_env(run), {})
+
+    def test_env_keys_match_the_prefix_ai_image_reads(self):
+        from app.services import ai_image
+
+        run = {"subject": "s", "variant": {}, "params": {"ai_image_style": "x"}}
+        key, = experiment.build_subprocess_env(run)
+        self.assertTrue(key.startswith(ai_image.ENV_SETTING_PREFIX))
+
 
 class TestResultsStore(unittest.TestCase):
     def setUp(self):
@@ -269,6 +307,30 @@ class TestResultsStore(unittest.TestCase):
 
     def test_mark_unknown_key_returns_false(self):
         self.assertFalse(experiment.mark_outcome(self.results, "nope", "hit"))
+
+    def test_failed_rewrite_leaves_the_store_intact(self):
+        # 人工评级无法重跑：results.jsonl 一旦被截断就永久丢失。
+        experiment.record_result(self.results, {"task_id": "a", "title": "T1", "outcome": None})
+        experiment.record_result(self.results, {"task_id": "b", "title": "T2", "outcome": "hit"})
+        before = Path(self.results).read_text(encoding="utf-8")
+
+        real_dumps = json.dumps
+        calls = []
+
+        def failing_dumps(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError("no space left on device")
+            return real_dumps(*args, **kwargs)
+
+        with patch("experiment.json.dumps", side_effect=failing_dumps):
+            with self.assertRaises(OSError):
+                experiment.mark_outcome(self.results, "a", "flop")
+
+        self.assertEqual(Path(self.results).read_text(encoding="utf-8"), before)
+        self.assertEqual(experiment.load_results(self.results)[1]["outcome"], "hit")
+        # 临时文件不能留在目录里。
+        self.assertEqual([child.name for child in self.tmp.iterdir()], ["results.jsonl"])
 
     def test_empty_title_is_not_a_lookup_key(self):
         # social_metadata["title"] 恒存在但可能是空字符串，此时 title 不能当作
@@ -453,6 +515,54 @@ class TestRunExperiment(_RunExperimentTestCase):
         self.assertFalse(records[0]["succeeded"])
         self.assertEqual(records[0]["title"], "")
         self.assertEqual(records[0]["fallback_beats"], 0)
+
+    def test_each_variant_gets_its_own_style_in_the_subprocess_environment(self):
+        # 这条用例钉死核心缺陷：ai_image_style 只能从 config.toml 读，两个子进程
+        # 共用同一份配置，若不按变体注入环境变量，两个分支会用完全相同的风格
+        # 生成，而 results.jsonl 却把它们标成 style-a / style-b。
+        with patch("experiment.subprocess.run", return_value=self._completed()) as mock_run, \
+                patch("app.services.task_artifacts.read_script_data", return_value=None):
+            experiment.run_experiment(self._spec_path(self.SPEC), self.results)
+
+        envs = [call.kwargs["env"] for call in mock_run.call_args_list]
+        styles = [env["MPT_AI_IMAGE_STYLE"] for env in envs]
+        self.assertEqual(styles, ["style-a", "style-b"])
+        self.assertEqual(len(set(styles)), 2)
+
+        recorded = [r["variant"]["ai_image_style"] for r in experiment.load_results(self.results)]
+        self.assertEqual(recorded, styles)
+
+    def test_subprocess_environment_extends_rather_than_replaces_os_environ(self):
+        with patch("experiment.subprocess.run", return_value=self._completed()) as mock_run, \
+                patch("app.services.task_artifacts.read_script_data", return_value=None):
+            experiment.run_experiment(self._spec_path(self.SPEC), self.results)
+
+        env = mock_run.call_args_list[0].kwargs["env"]
+        for key in os.environ:
+            self.assertIn(key, env)
+
+    def test_stores_the_published_truncation_of_a_long_title(self):
+        # upload_post 发到 YouTube 时截断到 100 字符，存全长会让人工 mark 永远匹配不上。
+        long_title = "Le mythe de Prométhée et le feu volé aux dieux de l'Olympe " * 3
+        self.assertGreater(len(long_title), experiment.PUBLISHED_TITLE_MAX)
+        script_data = {"social_metadata": {"title": long_title, "description": "d", "tags": []}}
+
+        with patch("experiment.subprocess.run", return_value=self._completed()), \
+                patch("app.services.task_artifacts.read_script_data", return_value=script_data):
+            experiment.run_experiment(self._spec_path(self.SPEC), self.results)
+
+        stored = experiment.load_results(self.results)[0]["title"]
+        self.assertEqual(stored, long_title[:experiment.PUBLISHED_TITLE_MAX])
+        self.assertEqual(len(stored), experiment.PUBLISHED_TITLE_MAX)
+        self.assertTrue(experiment.mark_outcome(self.results, stored, "hit"))
+
+    def test_short_titles_are_stored_unchanged(self):
+        script_data = {"social_metadata": {"title": "Le mythe", "description": "", "tags": []}}
+        with patch("experiment.subprocess.run", return_value=self._completed()), \
+                patch("app.services.task_artifacts.read_script_data", return_value=script_data):
+            experiment.run_experiment(self._spec_path(self.SPEC), self.results)
+
+        self.assertEqual(experiment.load_results(self.results)[0]["title"], "Le mythe")
 
     def test_empty_title_is_reported_as_a_lookup_gap(self):
         # llm.generate_social_metadata 始终返回三个键，标题失败时是空字符串而不是

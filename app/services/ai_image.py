@@ -37,6 +37,8 @@ DEFAULT_STYLE = (
 )
 MOTIONS = ("zoom_in", "zoom_out", "pan_left", "pan_right")
 DEFAULT_MAX_IMAGES = 12
+# ai_image_* 设置的环境变量覆盖前缀，见 _setting。
+ENV_SETTING_PREFIX = "MPT_"
 
 _ASPECT_RATIOS = {
     VideoAspect.portrait.value: "9:16",
@@ -81,8 +83,27 @@ def resolution(video_aspect) -> tuple[int, int]:
     return VideoAspect(_aspect_value(video_aspect)).to_resolution()
 
 
+def _setting(key: str, default):
+    """
+    读取 ``ai_image_*`` 配置，环境变量优先，未设置时完全退回 ``config.app``。
+
+    实验运行器为每个变体单独启动 ``cli.py`` 子进程，而 ``ai_image_*`` 不是
+    ``cli.py`` 的入参、只能来自 ``config.toml``：同一台机器上所有子进程读到的是
+    同一份配置，于是网格里的每个分支都用相同的风格生成，却被 ``results.jsonl``
+    标成不同分支——归因静默错乱，整轮实验作废。环境变量是唯一能按子进程区分、
+    又不需要改写 ``config.toml`` 的通道。
+
+    约定：``ai_image_style`` -> ``MPT_AI_IMAGE_STYLE``。空值视为未设置，
+    避免一个空环境变量把配置里的真实取值抹掉。
+    """
+    env_value = os.environ.get(ENV_SETTING_PREFIX + key.upper())
+    if env_value is not None and env_value.strip():
+        return env_value
+    return config.app.get(key, default)
+
+
 def _style() -> str:
-    return str(config.app.get("ai_image_style", DEFAULT_STYLE)).strip() or DEFAULT_STYLE
+    return str(_setting("ai_image_style", DEFAULT_STYLE)).strip() or DEFAULT_STYLE
 
 
 def _build_planning_prompt(script: str, count: int) -> str:
@@ -221,7 +242,7 @@ _SUPERSAMPLE = 4
 
 
 def pick_motion(index: int) -> str:
-    configured = str(config.app.get("ai_image_motion", "random")).strip().lower()
+    configured = str(_setting("ai_image_motion", "random")).strip().lower()
     if configured == "random":
         return MOTIONS[index % len(MOTIONS)]
     if configured not in MOTIONS:

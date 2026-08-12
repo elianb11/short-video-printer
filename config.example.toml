@@ -73,8 +73,11 @@ ai_image_enabled = false
 ai_image_model = "imagen-3.0-generate-002"
 # Style suffix appended to every prompt. Without it, each generated image lands
 # in a different art style and the video looks incoherent.
+# The MPT_AI_IMAGE_STYLE environment variable overrides this value; experiment.py
+# sets it per variant so one grid arm can differ from another without editing this file.
 ai_image_style = "peinture à l'huile cinématographique, clair-obscur dramatique, palette or et bleu profond"
 # Ken Burns motion: zoom_in, zoom_out, pan_left, pan_right, or random.
+# The MPT_AI_IMAGE_MOTION environment variable overrides this value, same as above.
 ai_image_motion = "random"
 # Hard ceiling on images per task — cost guard.
 ai_image_max_images_per_task = 12

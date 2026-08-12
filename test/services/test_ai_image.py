@@ -271,6 +271,53 @@ class TestGenerateImage(unittest.TestCase):
             ai_image.generate_image("p", "9:16", ai_image.image_cache_path(self.task_id, "p"))
 
 
+class TestEnvSettingOverride(unittest.TestCase):
+    """
+    ai_image_* 只能从 config.toml 读，而实验运行器为每个变体单独起子进程，
+    整台机器共用同一份 config.toml。没有环境变量覆盖，网格里所有分支都会用
+    同一个风格生成，results.jsonl 却把它们标成不同分支。
+    """
+
+    def setUp(self):
+        self.original_app_config = dict(config.app)
+
+    def tearDown(self):
+        config.app.clear()
+        config.app.update(self.original_app_config)
+
+    def test_style_prefers_environment_over_config(self):
+        config.app["ai_image_style"] = "config-style"
+        with patch.dict("os.environ", {"MPT_AI_IMAGE_STYLE": "env-style"}):
+            self.assertEqual(ai_image._style(), "env-style")
+
+    def test_style_falls_back_to_config_when_env_unset(self):
+        config.app["ai_image_style"] = "config-style"
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(ai_image._style(), "config-style")
+
+    def test_style_falls_back_to_default_without_config_or_env(self):
+        config.app.pop("ai_image_style", None)
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(ai_image._style(), ai_image.DEFAULT_STYLE)
+
+    def test_blank_env_does_not_shadow_config(self):
+        # 空环境变量按未设置处理，否则一个空值会抹掉配置里的真实取值。
+        config.app["ai_image_style"] = "config-style"
+        with patch.dict("os.environ", {"MPT_AI_IMAGE_STYLE": "   "}):
+            self.assertEqual(ai_image._style(), "config-style")
+
+    def test_motion_prefers_environment_over_config(self):
+        config.app["ai_image_motion"] = "random"
+        with patch.dict("os.environ", {"MPT_AI_IMAGE_MOTION": "pan_left"}):
+            self.assertEqual(ai_image.pick_motion(0), "pan_left")
+            self.assertEqual(ai_image.pick_motion(3), "pan_left")
+
+    def test_motion_falls_back_to_config_when_env_unset(self):
+        config.app["ai_image_motion"] = "zoom_out"
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(ai_image.pick_motion(0), "zoom_out")
+
+
 class TestKenBurns(unittest.TestCase):
     def setUp(self):
         self.original_app_config = dict(config.app)
