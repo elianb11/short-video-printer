@@ -15,12 +15,16 @@ AI 图片素材生成 —— 用 Imagen 生成分镜图，再用 ffmpeg 做 Ken 
     ai_image_fallback_source = "pexels"
 """
 
+import json
 import math
+import re
 
 from loguru import logger
 
 from app.config import config
 from app.models.schema import VideoAspect
+from app.services import task_artifacts
+from app.services.llm import _generate_response
 
 DEFAULT_MODEL = "imagen-3.0-generate-002"
 DEFAULT_STYLE = (
@@ -71,3 +75,63 @@ def aspect_ratio(video_aspect) -> str:
 
 def resolution(video_aspect) -> tuple[int, int]:
     return VideoAspect(_aspect_value(video_aspect)).to_resolution()
+
+
+def _style() -> str:
+    return str(config.app.get("ai_image_style", DEFAULT_STYLE)).strip() or DEFAULT_STYLE
+
+
+def _build_planning_prompt(script: str, count: int) -> str:
+    return f"""Tu es directeur artistique pour une vidéo courte de mythologie.
+
+Voici la narration:
+\"\"\"{script}\"\"\"
+
+Génère EXACTEMENT {count} descriptions d'images, une par plan, dans l'ordre de la narration.
+
+Règles impératives:
+1. Chaque description couvre le moment narratif de son plan.
+2. Varie les cadrages entre les plans (plan large, gros plan, contre-plongée) pour éviter la répétition.
+3. Reste ATMOSPHÉRIQUE et SYMBOLIQUE. Ne décris jamais de violence explicite, de sang,
+   de mutilation ni de nudité — suggère par l'ombre, la ruine, la lumière et le symbole.
+4. Pas de texte ni de lettres dans l'image.
+5. Ne mentionne aucun style artistique: il est ajouté automatiquement.
+
+Réponds UNIQUEMENT avec un tableau JSON de {count} chaînes, sans texte autour.
+Exemple: ["une silhouette au sommet d'une falaise", "un temple en ruine sous l'orage"]"""
+
+
+def _parse_prompt_list(response: str) -> list[str]:
+    match = re.search(r"\[.*\]", response or "", re.DOTALL)
+    if not match:
+        raise ValueError("no JSON array found in planning response")
+    items = json.loads(match.group(0))
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
+def plan_prompts(task_id: str, count: int) -> list[str]:
+    """生成 count 条已锁定风格的画面提示词。LLM 失败时降级为关键词提示。"""
+    script_data = task_artifacts.read_script_data(task_id) or {}
+    script = str(script_data.get("script", "")).strip()
+    search_terms = [str(term) for term in script_data.get("search_terms", []) if term]
+
+    bases: list[str] = []
+    try:
+        response = _generate_response(prompt=_build_planning_prompt(script, count))
+        bases = _parse_prompt_list(response)
+    except Exception as exc:
+        logger.warning(
+            "ai image prompt planning failed, falling back to search terms: "
+            f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
+        )
+
+    if not bases:
+        bases = search_terms or [script[:200] or "scène mythologique"]
+
+    # 数量对齐：多则截断，少则循环补齐，保证时间线每个分镜都有画面。
+    bases = bases[:count]
+    while len(bases) < count:
+        bases.append(bases[len(bases) % max(len(bases), 1)])
+
+    style = _style()
+    return [f"{base}, {style}" for base in bases]
